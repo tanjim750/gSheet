@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from ..config import ConfigurationError
-from .exceptions import APIClientError, APIErrorCode
+from .exceptions import APIClientError, APIErrorCode, APIErrorReason
 
 
 class OperationKind(StrEnum):
@@ -43,7 +43,13 @@ class AuthorizationPolicy:
 
     def authorize(self, spreadsheet_id: str, operations: frozenset[OperationKind],
                   batch_requests: frozenset[str] = frozenset()) -> None:
-        if (spreadsheet_id not in self.allowed_spreadsheet_ids
-                or not operations <= self.allowed_operations
-                or not batch_requests <= self.allowed_batch_requests):
-            raise APIClientError(APIErrorCode.PERMISSION_DENIED, outcome="validation_rejection")
+        if spreadsheet_id not in self.allowed_spreadsheet_ids:
+            raise APIClientError(APIErrorCode.PERMISSION_DENIED, outcome="validation_rejection",
+                                 reason=APIErrorReason.SPREADSHEET_NOT_ALLOWED)
+        if not operations <= self.allowed_operations:
+            raise APIClientError(APIErrorCode.PERMISSION_DENIED, outcome="validation_rejection",
+                                 reason=APIErrorReason.OPERATION_NOT_ALLOWED,
+                                 missing_operations=tuple(sorted(op.value for op in operations - self.allowed_operations)))
+        if not batch_requests <= self.allowed_batch_requests:
+            raise APIClientError(APIErrorCode.PERMISSION_DENIED, outcome="validation_rejection",
+                                 reason=APIErrorReason.BATCH_REQUEST_NOT_ALLOWED)

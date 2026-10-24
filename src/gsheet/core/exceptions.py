@@ -67,6 +67,37 @@ class APIErrorCode(StrEnum):
     CLOSED = "transport_closed"
 
 
+class ServiceErrorCode(StrEnum):
+    INVALID_INPUT = "invalid_service_input"
+    INVALID_RANGE = "invalid_service_range"
+    WORKSHEET_NOT_FOUND = "worksheet_not_found"
+    HEADER_NOT_FOUND = "header_not_found"
+    AMBIGUOUS_HEADER = "ambiguous_header"
+    UNSUPPORTED_LAYOUT = "unsupported_layout_operation"
+    MALFORMED_RESPONSE = "malformed_service_response"
+
+
+class SheetServiceError(ValueError):
+    """Fixed diagnostics; sheet values, titles, and input payloads are omitted."""
+
+    def __init__(self, code: ServiceErrorCode, *, field: str | None = None) -> None:
+        self.code, self.field = code, field
+        messages = {
+            ServiceErrorCode.INVALID_INPUT: "Invalid service input; check the named argument.",
+            ServiceErrorCode.INVALID_RANGE: "Range or index is invalid, out of grid bounds, or exceeds configured read limits.",
+            ServiceErrorCode.WORKSHEET_NOT_FOUND: "Worksheet was not found in fresh spreadsheet metadata.",
+            ServiceErrorCode.HEADER_NOT_FOUND: "No matching header or occurrence was found in the requested header row.",
+            ServiceErrorCode.AMBIGUOUS_HEADER: "Multiple headers match; select an explicit occurrence or column.",
+            ServiceErrorCode.UNSUPPORTED_LAYOUT: "This operation cannot safely target the current sheet layout.",
+            ServiceErrorCode.MALFORMED_RESPONSE: "The API response does not match the expected service contract.",
+        }
+        super().__init__(messages[code])
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {"code": self.code.value, "field": self.field, "message": str(self),
+                "source": "service_response" if self.code == ServiceErrorCode.MALFORMED_RESPONSE else "service_validation"}
+
+
 _API_MESSAGES = {
     APIErrorCode.INVALID_REQUEST: "Invalid or unsupported Sheets API request.",
     APIErrorCode.AUTHENTICATION: "Google rejected authentication; check the connection before retrying.",
@@ -84,13 +115,40 @@ _API_MESSAGES = {
 }
 
 
+class APIErrorSource(StrEnum):
+    CONFIGURATION = "configuration"
+    REQUEST_VALIDATION = "request_validation"
+    AUTHORIZATION = "local_authorization"
+    UPSTREAM = "google_api"
+    TRANSPORT = "transport"
+    THROTTLING = "local_throttling"
+    CLIENT = "client"
+
+
+class APIErrorReason(StrEnum):
+    READ_ONLY_CONFIGURATION = "read_only_configuration"
+    SPREADSHEET_NOT_ALLOWED = "spreadsheet_not_allowed"
+    OPERATION_NOT_ALLOWED = "operation_not_allowed"
+    BATCH_REQUEST_NOT_ALLOWED = "batch_request_not_allowed"
+
+
+_REASON_MESSAGES = {
+    APIErrorReason.READ_ONLY_CONFIGURATION: "The client's api.access_mode is read_only; writes require read_write.",
+    APIErrorReason.SPREADSHEET_NOT_ALLOWED: "The target spreadsheet is not allowed by this connection's authorization policy.",
+    APIErrorReason.OPERATION_NOT_ALLOWED: "The authorization policy does not grant every operation required by this request; see missing_operations.",
+    APIErrorReason.BATCH_REQUEST_NOT_ALLOWED: "A structural request type is not allowed by this connection's authorization policy.",
+}
+
+
 class APIClientError(Exception):
     """Safe request failure; never retains response bodies, URLs, or exceptions."""
 
     def __init__(self, code: APIErrorCode, *, status_code: int | None = None,
                  retryable: bool = False, outcome: str = "confirmed_failure",
                  attempts: int = 0, request_id: str | None = None,
-                 retry_after_seconds: float | None = None) -> None:
+                 retry_after_seconds: float | None = None,
+                 source: APIErrorSource | None = None, reason: APIErrorReason | None = None,
+                 missing_operations: tuple[str, ...] = ()) -> None:
         self.code = code
         self.status_code = status_code
         self.retryable = retryable
@@ -98,10 +156,27 @@ class APIClientError(Exception):
         self.attempts = attempts
         self.request_id = request_id
         self.retry_after_seconds = retry_after_seconds
-        super().__init__(_API_MESSAGES[code])
+        if source is None:
+            source = APIErrorSource.UPSTREAM if status_code is not None else {
+                APIErrorCode.INVALID_REQUEST: APIErrorSource.REQUEST_VALIDATION,
+                APIErrorCode.PERMISSION_DENIED: APIErrorSource.AUTHORIZATION,
+                APIErrorCode.THROTTLED: APIErrorSource.THROTTLING,
+                APIErrorCode.TIMEOUT: APIErrorSource.TRANSPORT,
+                APIErrorCode.TRANSPORT: APIErrorSource.TRANSPORT,
+                APIErrorCode.MALFORMED_RESPONSE: APIErrorSource.TRANSPORT,
+                APIErrorCode.UNCERTAIN_WRITE: APIErrorSource.TRANSPORT,
+            }.get(code, APIErrorSource.CLIENT)
+        if any(value not in {"read", "write", "structural", "destructive"} for value in missing_operations):
+            raise ValueError("Unsupported operation diagnostic")
+        self.source = source
+        self.reason = reason
+        self.missing_operations = tuple(missing_operations)
+        super().__init__(_REASON_MESSAGES[reason] if reason is not None else _API_MESSAGES[code])
 
-    def to_dict(self) -> dict[str, str | bool | int | float | None]:
+    def to_dict(self) -> dict[str, str | bool | int | float | None | tuple[str, ...]]:
         return {"code": self.code.value, "message": str(self),
                 "status_code": self.status_code, "retryable": self.retryable,
                 "outcome": self.outcome, "attempts": self.attempts,
-                "request_id": self.request_id, "retry_after_seconds": self.retry_after_seconds}
+                "request_id": self.request_id, "retry_after_seconds": self.retry_after_seconds,
+                "source": self.source.value, "reason": self.reason.value if self.reason is not None else None,
+                "missing_operations": self.missing_operations}
