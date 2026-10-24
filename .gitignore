@@ -1,3 +1,14 @@
 .env
+.env.*
+!.env.example
 gsheet-scaffold.txt
 docs
+
+# Store local credentials and OAuth tokens here, or outside the repository.
+.credentials/
+credentials.json
+service-account*.json
+service_account*.json
+client_secret*.json
+token.json
+tokens.json
