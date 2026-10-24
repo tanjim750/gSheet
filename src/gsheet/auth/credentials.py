@@ -270,15 +270,26 @@ class CredentialManager:
         if allow_browser is not True:
             raise AuthenticationError(Code.INTERACTION_NOT_ALLOWED)
         with self._lock:
-            self.initialize()
             if self._config.auth.mode != "oauth":
                 raise AuthenticationError(Code.UNSUPPORTED_MODE)
-            if self._credentials is not None and not reauthorize:
-                raise AuthenticationError(Code.AUTHORIZATION_REQUIRED, requires_interaction=True)
-            credentials = self._oauth.authorize(timeout_seconds=timeout_seconds)
+            if reauthorize:
+                from .oauth import OAuthAuthentication
+                oauth = OAuthAuthentication(self._config, self._connection_id)
+                oauth.prepare_reauthorization()
+            else:
+                self.initialize()
+                if self._credentials is not None:
+                    raise AuthenticationError(Code.AUTHORIZATION_REQUIRED, requires_interaction=True)
+                oauth = self._oauth
+            credentials = oauth.authorize(timeout_seconds=timeout_seconds)
             _check_scopes(credentials, self._config)
-            self._oauth.persist(credentials)
+            if not credentials.valid:
+                raise AuthenticationError(Code.AUTHORIZATION_FAILED, requires_interaction=True)
+            oauth.persist(credentials)
+            # Publish replacement state only after authorization and storage succeed.
+            self._oauth = oauth
             self._credentials = credentials
+            self._initialized = True
             self._interaction_required = False
             return self.status
 

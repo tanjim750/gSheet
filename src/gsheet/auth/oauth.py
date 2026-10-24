@@ -131,6 +131,30 @@ class OAuthAuthentication:
         self._observed_digest = _digest(info)
         return credentials
 
+    def prepare_reauthorization(self) -> None:
+        """Validate ownership/storage, not usability of the token being replaced.
+
+        Recover scope mismatches and corrupt credential fields only when the
+        connection/client binding remains verifiable. Unparseable, unbound,
+        foreign, or insecure files still fail closed. Snapshot the old file so
+        persist() can reject concurrent replacement after the browser flow.
+        """
+        self._load_client()
+        if self._path is None:
+            return
+        info = None
+        failure = None
+        try:
+            info = _read_json(self._path, secure=True)
+        except AuthenticationError as exc:
+            if exc.code != Code.MISSING_CREDENTIALS:
+                failure = exc
+        if failure is not None:
+            raise failure
+        if info is not None:
+            self._validate_binding(info)
+            self._observed_digest = _digest(info)
+
     def authorize(self, *, timeout_seconds: float) -> Credentials:
         valid_timeout = type(timeout_seconds) in (int, float) and timeout_seconds > 0
         if valid_timeout:
