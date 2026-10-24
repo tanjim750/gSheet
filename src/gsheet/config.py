@@ -122,8 +122,10 @@ class APIConfig(_Section):
         if scopes is None:
             scopes = (READ_SCOPE if self.access_mode == "read_only" else WRITE_SCOPE,)
             object.__setattr__(self, "scopes", scopes)
-        if not scopes or len(set(scopes)) != len(scopes) or not set(scopes) <= _SCOPES:
-            raise ConfigurationError("api.scopes", "provide distinct, supported Sheets API scopes")
+        if not scopes or not set(scopes) <= _SCOPES:
+            raise ConfigurationError("api.scopes", "GSHEET_API_SCOPES must contain supported raw HTTPS scope URLs; Markdown links, malformed URLs, and unsupported scopes are not accepted")
+        if len(set(scopes)) != len(scopes):
+            raise ConfigurationError("api.scopes", "provide distinct scopes without duplicates")
         has_write = bool(set(scopes) & _WRITE_SCOPES)
         if has_write != (self.access_mode == "read_write"):
             raise ConfigurationError("api.scopes", "scopes must match the selected access_mode")
