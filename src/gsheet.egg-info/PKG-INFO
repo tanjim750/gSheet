@@ -1,0 +1,126 @@
+Metadata-Version: 2.4
+Name: gsheet
+Version: 0.1.0
+Summary: Generic, layout-independent Google Sheets service
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: google-auth[requests]<3,>=2.38
+Requires-Dist: google-auth-oauthlib<2,>=1.2
+Provides-Extra: dotenv
+Requires-Dist: python-dotenv<2,>=1.0; extra == "dotenv"
+
+# gSheet
+
+Generic Python Google Sheets service foundation. Configuration and authentication
+are implemented; spreadsheet clients, repositories, and operations remain
+unimplemented. Python 3.11+ is required.
+
+## Configuration
+
+`GSheetConfig` contains immutable `APIConfig`, `AuthConfig`, `RetryConfig`,
+`CacheConfig`, and `OperationalConfig` sections. Explicit section objects replace
+the entire corresponding environment section. Remaining precedence is process
+environment, explicitly selected `.env` file, then application defaults.
+`.env` loading is optional through the `dotenv` package extra; see `.env.example`
+for supported variables. Loading never mutates the process environment.
+
+Configuration alone requires no credentials and makes no network calls. Sensitive
+paths are hidden from representations and redacted by `GSheetConfig.to_dict()`.
+Do not use generic object introspection for logging or serialization.
+
+## Authentication interface
+
+The root `gsheet` package exports `CredentialManager`, `AuthenticationStatus`,
+`AuthenticationError`, and `AuthenticationErrorCode` alongside configuration.
+Each manager takes a `GSheetConfig` and a required, stable `connection_id` keyword
+argument. The trusted application assigns that identifier; it must not come from
+spreadsheet data or AI-selected credentials. Use a distinct manager per connection.
+
+Public lifecycle methods:
+
+- `initialize(reload=False)` loads only configured local files. OAuth without a
+  stored token returns a status requiring interaction; no browser or network is
+  started. `reload=True` discards local state and rereads the configured files.
+- `status` reports initialization, local validity, refresh need, and interaction
+  need without contacting Google. Local validity does not detect remote revocation.
+- `requires_interactive_authorization()` initializes locally if necessary and
+  reports whether OAuth interaction is needed.
+- `get_credentials()` returns a sensitive Google-compatible object to the future
+  internal client, refreshing on demand if enabled and required. It never starts
+  OAuth interaction. Do not expose returned objects through tools, logs, or JSON.
+- `refresh()` explicitly refreshes credentials over HTTPS, using the configured
+  request timeout. It honors `refresh_enabled`, including for service accounts.
+- `authorize_interactively(allow_browser=False, reauthorize=False,
+  timeout_seconds=300)` is OAuth-only. `allow_browser=True` is mandatory. Existing
+  in-memory credentials require `reauthorize=True` for replacement. The local
+  callback wait defaults to 300 seconds; token exchange separately uses the API
+  request timeout. This synchronous call waits for the user and uses a loopback
+  listener, PKCE, OAuth state validation, explicit consent, and account selection.
+- `reset()` forgets in-memory state without deleting token files or revoking access.
+
+## Service-account lifecycle
+
+Set service-account mode and an explicit JSON credential path. Loading validates
+the credential type, required fields, signing key, Google token endpoint, and
+configured scopes. No ADC discovery, domain-wide delegation, identity fallback,
+or network validation occurs. A new service-account credential normally needs a
+token refresh before use. Refresh can establish a usable access token, but cannot
+prove access to a particular spreadsheet. Replace the configured file and reload
+to replace the identity deliberately.
+
+## OAuth lifecycle and storage
+
+OAuth requires a configured Google **installed-application** client JSON file.
+Web-client configurations, custom identity-provider endpoints, and alternative
+Google universes are unsupported. With no token file configured, authorization
+and refresh use memory only. Missing stored tokens require explicit interactive
+authorization. Expired tokens refresh only when refresh is enabled and a refresh
+token exists. Tokens with missing expiry are treated as needing refresh.
+
+Configured token files use Google authorized-user JSON plus a format version and
+a SHA-256 binding of the connection identifier. Client identity and exact scope
+sets must match. Plain Google token files without a binding are deliberately not
+adopted. Use a new per-connection token path and explicitly authorize to migrate;
+never relabel a token belonging to another business.
+
+Persistence writes a temporary file in the destination directory, flushes it,
+and publishes it atomically. On POSIX, tokens must be owned by the current user,
+have no group/other permissions or extra hard links, and are written with mode
+0600. Final symlinks are rejected where the OS supports `O_NOFOLLOW`. The parent
+directory must be owned by the current user and not group/world writable.
+Credential files must be regular files; their contents are never logged.
+
+A sibling `.lock` file serializes cooperating writers. Stored bindings and the
+loaded-file fingerprint are checked before replacement; new files are created
+without overwriting an existing destination. A crash can leave a stale lock;
+remove it only after ensuring no writer is active. Protect the directory from
+uncooperative writers. File contents are plaintext protected by OS permissions,
+not encryption; non-POSIX permission guarantees depend on the host ACLs.
+
+Revoked/expired grants return a structured error requiring explicit reauthorization.
+Refresh failures discard potentially mutated in-memory credentials. For a
+transient failure, explicitly reload before retrying; there is no automatic
+fallback or manager retry loop. Corrupt, foreign, insecure, or scope-mismatched
+token files fail closed; select a new connection-specific location to authorize
+again without overwriting them. Reauthorization does not revoke older grants.
+
+## Errors and authorization boundary
+
+`AuthenticationError.to_dict()` exposes only a fixed code/message, retryability,
+and whether interaction is required. Categories cover missing/invalid credentials,
+unsupported mode, missing authorization, expired/revoked grants, unavailable/failed
+refresh, insufficient scopes, storage failures, connection mismatches, network
+failures, missing interaction consent, and failed authorization.
+Upstream exception messages are not propagated. The callback handler never logs
+request URLs, and authentication operations suppress dependency auth/HTTP logging
+for their executing thread while secrets are in use.
+
+Authentication establishes credentials, not spreadsheet authorization. No manager
+method accepts a spreadsheet ID or grants administrative privileges. The future
+client must enforce connection-specific spreadsheet and operation permissions
+before every request. It must also respect refresh policy rather than relying on
+an unrestricted auto-refreshing transport. Valid-looking local scopes are not
+proof that Google actually granted them or that a spreadsheet is accessible.
+
+Runtime authentication dependencies are `google-auth[requests]` and
+`google-auth-oauthlib`. No Google Sheets data-access dependency is included.

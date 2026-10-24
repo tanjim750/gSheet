@@ -150,9 +150,9 @@ class AuthConfig(_Section):
                                                output=name == "oauth_token_file"))
 
     def validate_for_auth(self) -> None:
-        """Optional readiness check for future file-based auth, not a login flow.
+        """Optional readiness check for file-based auth, not a login flow.
 
-        OAuth token storage is optional (future callers may use in-memory tokens).
+        OAuth token storage is optional (callers may use in-memory tokens).
         Configuration construction itself never requires credentials.
         """
         if self.mode == "none":
