@@ -7,7 +7,7 @@ from ..auth import CredentialManager
 from ..config import GSheetConfig
 from ..core.permissions import AuthorizationPolicy
 from ..core.exceptions import APIClientError, APIErrorCode
-from .transport import APIResponse, SheetsEndpoint, SheetsTransport
+from .transport import APIResponse, RequestPreview, SheetsEndpoint, SheetsTransport
 
 
 class SheetsClient:
@@ -39,6 +39,13 @@ class SheetsClient:
                 body: dict[str, Any] | None = None) -> APIResponse:
         """Generic access to the supported endpoint registry, without arbitrary URLs."""
         return self._transport.request(endpoint, spreadsheet_id, range_name=range_name, params=params, body=body)
+
+    def validate_request(self, endpoint: SheetsEndpoint, spreadsheet_id: str, *,
+                         range_name: str | None = None, params: Mapping[str, Any] | None = None,
+                         body: dict[str, Any] | None = None) -> RequestPreview:
+        """Authorize/validate an operation without obtaining credentials or sending it."""
+        return self._transport.validate_request(endpoint, spreadsheet_id, range_name=range_name,
+                                                 params=params, body=body)
 
     def get_spreadsheet(self, spreadsheet_id: str, *, params: Mapping[str, Any] | None = None) -> APIResponse:
         return self.execute(SheetsEndpoint.SPREADSHEET_GET, spreadsheet_id, params=params)

@@ -75,6 +75,8 @@ class ServiceErrorCode(StrEnum):
     AMBIGUOUS_HEADER = "ambiguous_header"
     UNSUPPORTED_LAYOUT = "unsupported_layout_operation"
     MALFORMED_RESPONSE = "malformed_service_response"
+    PRECONDITION_FAILED = "write_precondition_failed"
+    FORMULA_PROTECTED = "formula_overwrite_rejected"
 
 
 class SheetServiceError(ValueError):
@@ -82,6 +84,8 @@ class SheetServiceError(ValueError):
 
     def __init__(self, code: ServiceErrorCode, *, field: str | None = None) -> None:
         self.code, self.field = code, field
+        self.outcome = "confirmed_failure" if code == ServiceErrorCode.MALFORMED_RESPONSE else "validation_rejection"
+        self.retryable = False
         messages = {
             ServiceErrorCode.INVALID_INPUT: "Invalid service input; check the named argument.",
             ServiceErrorCode.INVALID_RANGE: "Range or index is invalid, out of grid bounds, or exceeds configured read limits.",
@@ -90,12 +94,15 @@ class SheetServiceError(ValueError):
             ServiceErrorCode.AMBIGUOUS_HEADER: "Multiple headers match; select an explicit occurrence or column.",
             ServiceErrorCode.UNSUPPORTED_LAYOUT: "This operation cannot safely target the current sheet layout.",
             ServiceErrorCode.MALFORMED_RESPONSE: "The API response does not match the expected service contract.",
+            ServiceErrorCode.PRECONDITION_FAILED: "A write precondition was not satisfied or could not be established; resolve the target again.",
+            ServiceErrorCode.FORMULA_PROTECTED: "The mutation would overwrite an existing formula under the selected protection policy.",
         }
         super().__init__(messages[code])
 
-    def to_dict(self) -> dict[str, str | None]:
+    def to_dict(self) -> dict[str, str | bool | None]:
         return {"code": self.code.value, "field": self.field, "message": str(self),
-                "source": "service_response" if self.code == ServiceErrorCode.MALFORMED_RESPONSE else "service_validation"}
+                "source": "service_response" if self.code == ServiceErrorCode.MALFORMED_RESPONSE else "service_validation",
+                "outcome": self.outcome, "retryable": self.retryable}
 
 
 _API_MESSAGES = {

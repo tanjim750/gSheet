@@ -1,8 +1,9 @@
 # gSheet
 
 Generic Python Google Sheets service foundation. Configuration, authentication,
-and the low-level Sheets API client are implemented. Repositories, high-level
-services, and the facade remain unimplemented. Python 3.11+ is required.
+the low-level Sheets API client, and the generic SheetService are implemented.
+Repositories, the facade, and business-specific wrappers remain unimplemented.
+Python 3.11+ is required.
 
 ## Configuration
 
@@ -16,6 +17,9 @@ for supported variables. Loading never mutates the process environment.
 Configuration alone requires no credentials and makes no network calls. Sensitive
 paths are hidden from representations and redacted by `GSheetConfig.to_dict()`.
 Do not use generic object introspection for logging or serialization.
+Scopes must be supported raw HTTPS URLs, comma-separated in GSHEET_API_SCOPES.
+Markdown links, malformed URLs, unknown scopes, and duplicates are rejected as
+`ConfigurationError` for `api.scopes`; values are never rewritten into scope URLs.
 
 ## Authentication interface
 
@@ -41,7 +45,9 @@ Public lifecycle methods:
   request timeout. It honors `refresh_enabled`, including for service accounts.
 - `authorize_interactively(allow_browser=False, reauthorize=False,
   timeout_seconds=300)` is OAuth-only. `allow_browser=True` is mandatory. Existing
-  in-memory credentials require `reauthorize=True` for replacement. The local
+  in-memory credentials require `reauthorize=True` for replacement. Explicit
+  reauthorization checks storage ownership/binding without requiring the old
+  credentials to initialize successfully. The local
   callback wait defaults to 300 seconds; token exchange separately uses the API
   request timeout. This synchronous call waits for the user and uses a loopback
   listener, PKCE, OAuth state validation, explicit consent, and account selection.
@@ -89,9 +95,16 @@ not encryption; non-POSIX permission guarantees depend on the host ACLs.
 Revoked/expired grants return a structured error requiring explicit reauthorization.
 Refresh failures discard potentially mutated in-memory credentials. For a
 transient failure, explicitly reload before retrying; there is no automatic
-fallback or manager retry loop. Corrupt, foreign, insecure, or scope-mismatched
-token files fail closed; select a new connection-specific location to authorize
-again without overwriting them. Reauthorization does not revoke older grants.
+fallback or manager retry loop. Normal initialization still rejects corrupt or
+scope-mismatched tokens. Explicit reauthorization can replace incompatible scopes,
+expired/revoked credentials, or corrupt credential fields when the JSON connection
+and OAuth-client binding remain intact. Old tokens and in-memory credentials are
+preserved until new authorization, validation, and atomic storage succeed. The old
+file fingerprint is checked again before replacement to reject concurrent changes.
+Foreign, unbound, insecure, or unparseable files remain blocked: their ownership
+cannot be safely established. Select a new connection-specific storage location
+to authorize without deleting or overwriting them. Reauthorization does not revoke
+older grants.
 
 ## Errors and authorization boundary
 
@@ -143,7 +156,7 @@ are unsupported. The fixed endpoint registry determines methods and retry safety
 
 No supported endpoint uses HTTP DELETE; deletion is a permitted POST batch request.
 IDs and A1 ranges are encoded as path components. A1 parsing, coordinate resolution,
-padding, dimensional checks, and high-level cell semantics belong to later layers.
+padding, and dimensional checks are provided separately by SheetService.
 Query parameters use Google's camelCase names and endpoint-specific allowlists;
 boolean, range-list, enum, and field-mask input types are checked locally. Unknown
 query parameters, unsupported endpoints, non-finite JSON numbers, malformed value
@@ -156,8 +169,8 @@ to `spreadsheetId,properties,sheets.properties` with grid data disabled. Explici
 `fields`, `ranges`, and `includeGridData` support targeted reads. Google's rules
 for field masks versus includeGridData still apply. Batch range counts obey
 `max_read_batch_ranges` and `max_write_batch_ranges`; the latter is a values-range
-limit, not a structural-request count. `max_read_cells` needs future range/grid
-resolution and is not enforced by this raw endpoint layer.
+limit, not a structural-request count. `max_read_cells` is not enforced by this
+raw endpoint layer; SheetService bounds and limits reads using fresh dimensions.
 
 `APIResponse` contains `data` (unaltered Google JSON), status code, local request
 ID, attempt count, and elapsed seconds. Its representation excludes data. Treat
@@ -235,3 +248,240 @@ throttling, timeout, transport, upstream, malformed response, uncertain write,
 other HTTP errors, and closed transport. Credential-manager AuthenticationError
 exceptions remain separate and propagate unchanged. Upstream bodies/descriptions
 are intentionally excluded from failures.
+
+Additional diagnostics identify `source` (configuration, request_validation,
+local_authorization, google_api, transport, local_throttling, or client). Local
+permission failures have a fixed `reason`: read_only_configuration,
+spreadsheet_not_allowed, operation_not_allowed, or batch_request_not_allowed.
+Operation denials also report safe `missing_operations` names. These distinguish
+the actual client's read-only configuration from policy rejection and an upstream
+HTTP 403. OAuth scope mismatches remain `AuthenticationError` with the existing
+insufficient_configured_scopes code; invalid configured scopes fail earlier as
+`ConfigurationError`. Request and response content is excluded from diagnostics.
+
+## Diagnosing local integration configuration
+
+Use the project's installed Python environment (locally, `.venv/bin/python`) and
+verify `gsheet.__file__` points to the intended checkout. A system interpreter may
+have a different installation or no gSheet package at all.
+
+`GSheetConfig()` does not automatically read `.env`. To use that file, explicitly
+select `GSheetConfig(dotenv_path=Path(".env").absolute())` with `Path` imported from
+`pathlib`. Pass that same config object to CredentialManager and SheetsClient.
+Constructing another default configuration for the client restores read-only
+defaults even if the credential manager used read/write configuration.
+
+Process variables override `.env`; explicit section objects override both, for
+the entire section. A scope check using `environ={}` or an explicit APIConfig
+verifies that input, not the local `.env` file. Check the actual effective
+`config.api.access_mode` and scope tuple. The read/write scope must be exactly
+`https://www.googleapis.com/auth/spreadsheets`; Markdown formatting is not part of
+the URL. Do not print the full environment or credential objects for diagnostics.
+
+An update rejected with source=configuration and reason=read_only_configuration
+needs the correct client configuration, not broader spreadsheet grants. A
+local_authorization error identifies policy rejection; a google_api error has
+the upstream HTTP status. Successful local write preparation does not establish
+that the named tab exists: verify tab titles with metadata first. Never create a
+test tab or perform a live write merely to diagnose configuration without the
+owner's approval.
+
+## Generic Sheet Service
+
+The dependency flow is business wrapper → SheetService → SheetsClient → Google
+Sheets API. One coherent service uses focused range/value utilities and small
+physical-grid/result types. It does not implement repositories, the facade,
+schema discovery, business entities, or database identity.
+
+Construct with an existing authorized client and an explicit spreadsheet ID:
+
+```python
+from gsheet import SheetService
+
+service = SheetService(client, spreadsheet_id, limits=config.operations)
+```
+
+Construction performs no I/O, loads no credentials, and starts no OAuth flow.
+The caller owns the client lifecycle. Pass the matching configuration's
+OperationalConfig as `limits`; omitting it uses the application defaults, not
+the client's custom limits. The client independently enforces its own limits
+and permissions. A spreadsheet is the entire file; a worksheet is a tab.
+Worksheet arguments accept an exact title or numeric sheet ID (not tab index).
+
+### Public method inventory
+
+| Group | Methods |
+|---|---|
+| Spreadsheet metadata | `get_spreadsheet(fields=...)` |
+| Worksheets | `list_worksheets`, `get_worksheet`, `worksheet_exists`, `create_worksheet`, `rename_worksheet`, `delete_worksheet`, `duplicate_worksheet` |
+| Cells | `read_cell`, `update_cell`, `clear_cell`, `update_cells` |
+| Ranges | `read_range`, `update_range`, `clear_range`, `read_ranges`, `update_ranges` |
+| Rows | `read_row`, `read_rows`, `update_row`, `update_rows`, `append_rows`, `insert_rows`, `delete_rows`, `clear_row`, `find_rows` |
+| Headers | `read_headers`, `set_headers`, `find_columns`, `find_column`, `rename_header` |
+| Columns | `add_columns`, `insert_columns`, `remove_columns`, `move_columns`, `reorder_columns` |
+| Ordered dimension batches | `batch_structure` |
+
+All data/structure methods take a worksheet argument, except creation and the
+explicit per-worksheet entries in batch_structure. Mutations return the existing
+APIResponse, retaining actual updated ranges/counts and structural replies from
+Google. Creating/duplicating returns the API response containing the new sheet
+properties; it does not hide an extra metadata read. `reorder_columns` returns
+None when the requested order is already satisfied.
+
+Metadata methods return APIResponse or WorksheetInfo as appropriate; listing
+returns worksheet metadata in physical tab order. WorksheetInfo includes ID,
+title, tab index, dimensions, merged CellRanges, and raw metadata (excluded from
+repr). No metadata cache is kept. Structural mutations resolve current metadata
+before sending numeric sheet IDs. All service requests still go through client
+authorization; metadata resolution means service mutations also need READ.
+
+### Coordinates and ranges
+
+Every public numeric row/column index is **zero-based**, with **end-exclusive**
+intervals. Row 0/column 0 identifies A1. Rows are positions, never stable record
+IDs. A worksheet's numeric sheet ID is distinct from its tab index.
+
+`CellRange(start_row, start_column, end_row, end_column)` represents a rectangle;
+end bounds may be None until resolved against known worksheet dimensions. Range
+methods accept CellRange or A1 text. A1 input may be unqualified or qualified
+with the selected worksheet's exact title. A mismatched title is rejected.
+All generated references quote titles and double embedded apostrophes.
+
+Exported utilities are `column_index_to_a1`, `column_a1_to_index`,
+`row_index_to_a1`, `row_a1_to_index`, `quote_sheet_name`, `parse_a1_range`, and
+`format_a1_range`. The parser returns `(optional_title, CellRange)` and supports
+cells, rectangles, absolute `$` references, whole columns/rows, and open-ended
+forms such as A2:B or B2:5. Formatting requires bounded coordinates and emits
+canonical qualified A1. Named ranges, R1C1 notation, external spreadsheet
+references, and interpreting a bare title as a whole sheet are unsupported.
+
+Ranges are checked against fresh grid bounds. Ordinary updates do not implicitly
+resize a grid. A write matrix may be ragged and smaller than its target; supplied
+values must fit, and omitted trailing values are not padded or cleared.
+`update_rows` derives the target rectangle from the supplied matrix and start
+position. Explicit clear operations clear contents while preserving formatting;
+deleting dimensions removes rows/columns and shifts positions.
+
+### Read and write semantics
+
+Range/row/header reads return RangeValues with spreadsheet ID, WorksheetInfo,
+resolved CellRange, values matrix, read mode, and original APIResponse. Batch
+reads return one RangeValues per requested range, in request order. `read_cell`
+returns a scalar or None when no value is available. Values/formulas are excluded
+from RangeValues repr. Raw API response content remains available to trusted
+callers and must be handled as potentially sensitive, untrusted data.
+
+Read modes are FORMATTED_VALUE (default), UNFORMATTED_VALUE, and FORMULA. Formatted
+reads follow Google formatting/locale; unformatted reads preserve numeric and
+boolean types, including date/time serial numbers; FORMULA requests formula
+expressions. This service does not silently convert dates, booleans, or numbers
+to strings. Detailed effective/formatted/user-entered cell metadata remains
+available through targeted get_spreadsheet field masks, not an invented cell ORM.
+
+Sparse output is preserved by default. `pad=True` fills omitted bounded positions
+with None without modifying the API response. None denotes unavailable API data,
+not proof of an empty cell versus an omitted cell. Explicit empty strings remain
+empty strings. Google values endpoints cannot expose every empty/missing-cell
+distinction; no lossless reconstruction is claimed.
+
+Writes default to RAW. USER_ENTERED is explicit and enables Google's locale-aware
+parsing, including formulas. RAW leaves formula-like untrusted strings literal.
+None skips a value; an empty string explicitly empties its contents under Google's
+values API. No omitted field is treated as a clear request. Existing formulas
+inside a caller's explicit mutation target can be overwritten; there is no hidden
+formula protection or automatic post-write verification.
+
+### Headers, merges, and dynamic layouts
+
+Header operations require an explicit `header_row`; no worksheet is assumed to
+have headers. `read_headers(depth=...)` returns ordinary rows and merge metadata,
+without filling merged values into covered cells or inferring a hierarchy.
+`set_headers` writes one row; use update_range for a caller-defined multirow header.
+Headers need not be unique or database fields. Lookup uses exact displayed strings.
+`find_columns` returns every matching physical column. `find_column` rejects
+duplicates unless an explicit zero-based occurrence is selected. rename_header
+uses the same rule; missing headers never fall back to another column.
+
+The service exposes merged coordinates and permits value updates at merge anchors.
+It rejects non-null values addressed to covered merged cells instead of unmerging
+or flattening them. A null skip over a covered position is allowed. A structural
+move/delete may still conflict with Google's merge/protection rules; upstream
+errors propagate. There is no business-specific nested-header interpretation.
+
+`find_rows` requires a bounded row interval and explicit numeric column. It returns
+physical row indexes in order, using the selected read representation. Numeric
+equality does not confuse booleans with 0/1. Searching for None matches unavailable
+positions as represented by the values endpoint, not a guaranteed blank-cell type.
+
+### Structural and batch behavior
+
+`insert_rows`/`insert_columns` insert blank dimensions before an existing index.
+The start must be inside the current grid; inheritance from before is invalid at
+index 0. `add_columns` appends physical grid columns. `append_rows` appends values
+using Google's logical-table detection within the required explicit table_range;
+it is not insertion at an exact row. It returns the API's actual append range.
+Filling inserted blank rows is a separate explicit update, not an implicit
+multi-request transaction. Google validates remaining grid/cell-count constraints.
+
+`move_columns` uses Google's **pre-removal destination index**, not the final index
+of the moved block. Destinations inside or immediately adjoining the source are
+rejected as invalid/no-op. `reorder_columns(order, start_column=...)` takes a
+permutation of the absolute column indexes in one contiguous block, preserves
+columns outside that block, and generates ordered moveDimension requests.
+
+`StructuralChange` describes insert_rows, delete_rows, insert_columns,
+delete_columns, add_columns, or move_columns, with worksheet, start/end, count,
+destination, and inheritance arguments as relevant. batch_structure resolves
+metadata once and validates changes in order, tracking dimensions after previous
+changes. Callers express later indexes in that resulting grid. It submits one
+structural API batch. Worksheet create/rename/delete/duplicate remain separate
+methods; arbitrary raw structural payload orchestration stays in SheetsClient.
+
+Noncontiguous reads/writes and cell updates use the values batch endpoints.
+Write regions must not overlap. Read/write range counts honor service limits;
+total resolved cells across a read batch must not exceed max_read_cells. Reads
+and writes are never silently chunked into partially successful sequences.
+Read/update batches currently address one worksheet per service call; ordered
+structural batches can address multiple existing worksheets.
+
+No underlying authorization is bypassed: value writes require WRITE; clear
+requires DESTRUCTIVE too; structural batches require WRITE, STRUCTURAL, and each
+request-type grant. Deletes/moves and conservative updateSheetProperties handling
+add DESTRUCTIVE as documented above (including worksheet rename). An unknown
+request type or missing grant still fails closed. Uncertain writes propagate
+unchanged; the service does not replay mutations or claim rollback across calls.
+
+### Errors, verification, and manual integration
+
+SheetServiceError distinguishes invalid input/range, worksheet-not-found,
+header-not-found, ambiguous header, unsupported layout, and malformed service
+response. Its diagnostics omit cell contents and titles. APIClientError and
+AuthenticationError propagate unchanged, retaining local/upstream distinctions.
+worksheet_exists returns False only for a missing worksheet; it never swallows
+spreadsheet permission, authentication, or network failures.
+
+Run the standalone standard-library verifier with no real credentials or network:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python verify_sheet_service.py
+```
+
+It uses autospecced clients and mocked HTTP, including the actual authorization
+path. No tests/ or examples/ directory or extra test dependency is required.
+
+For manual integration, explicitly load the existing authorized configuration,
+reuse its CredentialManager/SheetsClient and a spreadsheet-scoped policy, and pass
+config.operations into SheetService. First list worksheets and confirm the
+dedicated gSheet_Test tab exists. Do not modify Sheet1. Read a bounded range in
+each needed mode; only after explicit approval write a disposable bounded test
+region on that tab and read it back. Exercise clear, insert/delete, column moves,
+rename, and tab deletion only on disposable data with separate explicit approval
+and the exact structural/destructive grants. No live calls are made by verification.
+
+Remaining limitations include concurrent external edits between metadata/values
+discovery and mutation, no compare-and-swap, no stable row identity, no automatic
+header hierarchy or merge discovery beyond exposed metadata, no non-grid data
+operations, no cross-worksheet values batching in this interface, and no automatic
+chunking. Header lookup followed by rename is also best-effort, not atomic. Direct
+external sorts, insertions, or edits can invalidate positions even after fresh
+reads; the business wrapper must re-resolve logical targets and coordinate writes.

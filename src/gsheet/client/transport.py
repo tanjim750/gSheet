@@ -35,7 +35,7 @@ from requests.exceptions import (
 from ..auth import AuthenticationError, CredentialManager
 from ..auth.credentials import _quiet_auth_logging
 from ..config import ConfigurationError, GSheetConfig
-from ..core.exceptions import APIClientError, APIErrorCode as Code
+from ..core.exceptions import APIClientError, APIErrorCode as Code, APIErrorReason, APIErrorSource
 from ..core.permissions import AuthorizationPolicy, OperationKind as Op
 
 
@@ -137,6 +137,24 @@ class APIResponse:
     attempts: int
     elapsed_seconds: float
 
+    @property
+    def outcome(self) -> str:
+        return "confirmed_success"
+
+
+@dataclass(frozen=True)
+class RequestPreview:
+    """Informational snapshot, never an executable authorization capability."""
+
+    endpoint: SheetsEndpoint
+    method: str
+    spreadsheet_id: str = field(repr=False)
+    range_name: str | None = field(repr=False)
+    params: dict[str, Any] = field(repr=False)
+    body: dict[str, Any] | None = field(repr=False)
+    checks: tuple[str, ...] = ("request_validation", "authorization")
+    outcome: str = field(default="validation_only", init=False)
+
 
 class SheetsTransport:
     """One synchronous connection, credential manager, policy, and HTTP session.
@@ -184,6 +202,16 @@ class SheetsTransport:
 
     def __exit__(self, *args: Any) -> None:
         self.close()
+
+    def validate_request(self, endpoint: SheetsEndpoint, spreadsheet_id: str, *,
+                         range_name: str | None = None, params: Mapping[str, Any] | None = None,
+                         body: dict[str, Any] | None = None) -> RequestPreview:
+        """Run the same preflight as execution, without credentials, quotas, or I/O."""
+        with self._lock:
+            if self._closed:
+                raise APIClientError(Code.CLOSED)
+            method, _, query, data, _ = self._prepare(endpoint, spreadsheet_id, range_name, params, body)
+            return RequestPreview(endpoint, method, spreadsheet_id, range_name, query, data)
 
     def _prepare(self, endpoint: SheetsEndpoint, spreadsheet_id: str, range_name: str | None,
                  params: Mapping[str, Any] | None, body: dict[str, Any] | None
@@ -278,7 +306,9 @@ class SheetsTransport:
             if query.get("includeValuesInResponse") is True or data.get("includeValuesInResponse") is True or data.get("includeSpreadsheetInResponse") is True:
                 operations.add(Op.READ)
             if self._config.api.access_mode != "read_write":
-                raise APIClientError(Code.PERMISSION_DENIED, outcome="validation_rejection")
+                raise APIClientError(Code.PERMISSION_DENIED, outcome="validation_rejection",
+                                     source=APIErrorSource.CONFIGURATION,
+                                     reason=APIErrorReason.READ_ONLY_CONFIGURATION)
         self._authorization.authorize(spreadsheet_id, frozenset(operations), batch_types)
         url = "https://sheets.googleapis.com/v4/spreadsheets/" + quote(spreadsheet_id, safe="")
         url += suffix.replace("{range}", quote(range_name, safe="") if ranged else "")
