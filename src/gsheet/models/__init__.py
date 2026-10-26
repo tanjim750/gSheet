@@ -1,8 +1,10 @@
 """Generic physical grid and operation contracts."""
 
-from .operations import StructuralChange
-from .ranges import CellRange
-from .results import CellValue, RangeValues, ReadMode, WriteMode
+from .operations import StructuralChange, WritePrecondition, WriteSafety
+from .ranges import CellRange, ResolvedRange
+from .results import CellValue, GridDataResult, RangeValues, ReadMode, WriteMode
+from .cells import CellInfo
 from .spreadsheet import WorksheetInfo
 
-__all__ = ["CellRange", "CellValue", "RangeValues", "ReadMode", "StructuralChange", "WorksheetInfo", "WriteMode"]
+__all__ = ["CellInfo", "CellRange", "CellValue", "GridDataResult", "RangeValues", "ReadMode",
+           "ResolvedRange", "StructuralChange", "WorksheetInfo", "WriteMode", "WritePrecondition", "WriteSafety"]

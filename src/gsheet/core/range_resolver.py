@@ -90,7 +90,10 @@ def parse_a1_range(reference: str) -> tuple[str | None, CellRange]:
             raise SheetServiceError(Code.INVALID_RANGE, field="range")
         end_row, end_column = start_row + 1, start_column + 1
     else:
-        last_row, last_column = point(parts[1])
+        if parts[1] == "" and start_row is not None and start_column is not None:
+            last_row, last_column = None, None
+        else:
+            last_row, last_column = point(parts[1])
         if (start_row is None and last_row is not None) or (start_column is None and last_column is not None):
             raise SheetServiceError(Code.INVALID_RANGE, field="range")
         end_row = last_row + 1 if last_row is not None else None

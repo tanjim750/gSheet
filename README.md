@@ -220,7 +220,10 @@ delay instead of retrying early. No retries are added by the HTTP adapter.
 
 Every mutation has one attempt. Lost connections, timeouts, 5xx, redirects, or
 malformed successful responses return `write_outcome_uncertain` and never replay
-the mutation. Known 4xx rejections remain confirmed failures. No blanket batch
+the mutation. A specifically identified ConnectTimeout occurs before connection
+establishment and returns request_timeout/confirmed_failure instead; it still
+does not trigger an automatic write retry. ReadTimeout and ambiguous Timeout or
+connection interruptions remain uncertain. Known 4xx rejections remain confirmed failures. No blanket batch
 atomicity, rollback, or idempotency guarantee is inferred. Read-only retries never
 initiate interactive authorization. An HTTP 401 returns an authentication error
 for explicit caller handling rather than silently switching identity or replaying.
@@ -320,11 +323,15 @@ Worksheet arguments accept an exact title or numeric sheet ID (not tab index).
 | Headers | `read_headers`, `set_headers`, `find_columns`, `find_column`, `rename_header` |
 | Columns | `add_columns`, `insert_columns`, `remove_columns`, `move_columns`, `reorder_columns` |
 | Ordered dimension batches | `batch_structure` |
+| P0 detailed reads and resolution | `resolve_range`, `get_grid_data`, `get_merged_ranges` |
+| Restricted structural foundation | `batch_update` |
 
-All data/structure methods take a worksheet argument, except creation and the
-explicit per-worksheet entries in batch_structure. Mutations return the existing
+All data/structure methods take a worksheet argument, except creation,
+spreadsheet-level batch_update, and the per-worksheet entries in batch_structure.
+Normal mutations return the existing
 APIResponse, retaining actual updated ranges/counts and structural replies from
-Google. Creating/duplicating returns the API response containing the new sheet
+Google. Supported safety-enabled dry-runs return RequestPreview instead.
+Creating/duplicating returns the API response containing the new sheet
 properties; it does not hide an extra metadata read. `reorder_columns` returns
 None when the requested order is already satisfied.
 
@@ -351,7 +358,8 @@ Exported utilities are `column_index_to_a1`, `column_a1_to_index`,
 `row_index_to_a1`, `row_a1_to_index`, `quote_sheet_name`, `parse_a1_range`, and
 `format_a1_range`. The parser returns `(optional_title, CellRange)` and supports
 cells, rectangles, absolute `$` references, whole columns/rows, and open-ended
-forms such as A2:B or B2:5. Formatting requires bounded coordinates and emits
+forms such as A2:B, B2:5, or A5: (both end bounds unknown). The service explicitly
+bounds these using fresh grid dimensions before API reads. Formatting requires bounded coordinates and emits
 canonical qualified A1. Named ranges, R1C1 notation, external spreadsheet
 references, and interpreting a bare title as a whole sheet are unsupported.
 
@@ -375,8 +383,8 @@ Read modes are FORMATTED_VALUE (default), UNFORMATTED_VALUE, and FORMULA. Format
 reads follow Google formatting/locale; unformatted reads preserve numeric and
 boolean types, including date/time serial numbers; FORMULA requests formula
 expressions. This service does not silently convert dates, booleans, or numbers
-to strings. Detailed effective/formatted/user-entered cell metadata remains
-available through targeted get_spreadsheet field masks, not an invented cell ORM.
+to strings. Detailed effective/formatted/user-entered cell metadata is available
+through bounded get_grid_data reads and targeted field masks.
 
 Sparse output is preserved by default. `pad=True` fills omitted bounded positions
 with None without modifying the API response. None denotes unavailable API data,
@@ -388,8 +396,9 @@ Writes default to RAW. USER_ENTERED is explicit and enables Google's locale-awar
 parsing, including formulas. RAW leaves formula-like untrusted strings literal.
 None skips a value; an empty string explicitly empties its contents under Google's
 values API. No omitted field is treated as a clear request. Existing formulas
-inside a caller's explicit mutation target can be overwritten; there is no hidden
-formula protection or automatic post-write verification.
+inside a caller's explicit mutation target can be overwritten by default. Optional
+WriteSafety provides explicit formula protection/preconditions; post-write
+verification remains a separate caller read.
 
 ### Headers, merges, and dynamic layouts
 
@@ -485,3 +494,218 @@ operations, no cross-worksheet values batching in this interface, and no automat
 chunking. Header lookup followed by rename is also best-effort, not atomic. Direct
 external sorts, insertions, or edits can invalidate positions even after fresh
 reads; the business wrapper must re-resolve logical targets and coordinate writes.
+
+## Phase 1 (P0) contracts
+
+The service keeps the original 37 methods and adds four: resolve_range,
+get_grid_data, get_merged_ranges, and batch_update. No redundant get_values,
+list_sheets, or get_sheet aliases are added: read_range/read_ranges,
+list_worksheets/get_worksheet, update_range/update_ranges, and append_rows satisfy
+the specification's corresponding value/tab operations.
+
+### Gap analysis and coverage
+
+| Requirement | Starting implementation | Starting status | P0 action |
+|---|---|---|---|
+| §4 spreadsheet/tab metadata | Existing metadata methods | Complete | Preserved typed WorksheetInfo and field selection |
+| §5, §18 value reads/alignment | read_range/read_ranges, padding | Complete | Preserved and regression-checked |
+| §5, §18 targeted grid and cell semantics | Raw metadata only | Partial | Added CellInfo and GridDataResult |
+| §5 merged ranges | WorksheetInfo merges | Partial | Added context-bearing get_merged_ranges |
+| §17 range contract | Parser and conversions | Partial | Added resolve_range with explicit bounding |
+| §6–7 essential writes/batches | Existing client and convenience service | Complete foundation | Reused; exposed restricted generic batch_update |
+| §19 identity/stale-target preconditions | None | Missing | Added WritePrecondition and structured rejection |
+| §20 formula overwrite policy | None | Missing | Added opt-in protection of reported formulas |
+| §20 authorized dry-run | None | Missing | Added shared client/transport preflight and RequestPreview |
+| §10–12, §20 outcomes/security/retry | Existing errors, grants, one-attempt writes | Partial | Kept execution; made success/validation outcomes explicit |
+| §23–24 applicable P0 acceptance | Original 15 offline checks | Partial | Extended root verifier with P0 and compatibility checks |
+
+### Resolved ranges and detailed cells
+
+`resolve_range(worksheet, region, bounded=False)` returns ResolvedRange with
+spreadsheet_id, numeric sheet_id, exact sheet_title, and CellRange. Unknown end
+bounds remain None. `bounded=True` explicitly uses fresh worksheet dimensions;
+invalid/out-of-grid ranges are rejected. ResolvedRange.a1 formats only bounded
+ranges and otherwise raises a structured range error. It never invents grid size.
+`get_merged_ranges` returns ResolvedRanges for each merge, including identity and
+numeric start-inclusive/end-exclusive coordinates; it does not interpret headers.
+
+`get_grid_data(worksheet, region, fields=..., pad=False)` requires a range that can
+be bounded within the selected GRID worksheet. It resolves fresh dimensions and
+enforces max_read_cells, then requests only that range and the selected CellData
+fields. Default fields are userEnteredValue, effectiveValue, formattedValue,
+userEnteredFormat, and effectiveFormat. Callers may choose any subset or dotted
+subfields such as effectiveFormat.numberFormat. Unknown subfield names remain
+Google-validated. Wildcards and arbitrary mask syntax are not accepted here.
+DATA_SOURCE grid reads are rejected because Google can return their entire grid
+despite a requested range; OBJECT sheets have no supported grid.
+
+GridDataResult contains spreadsheet identity, WorksheetInfo, bounded region,
+coordinate-ordered CellInfo entries, locale, timezone, and original APIResponse.
+Each CellInfo retains row/column, sheet ID, requested_fields, entry_present, and
+separate user_entered_value/effective_value/formatted_value and format dictionaries.
+The formula, error, and number_format properties expose their respective available
+fields without conflating calculated values with entered formulas. Number format
+prefers effective formatting, falling back to entered formatting. Numeric date/time
+serials remain numeric; no Python date conversion occurs.
+
+Without padding, only reported cell entries are returned, each carrying physical
+coordinates. Padding adds entries with entry_present=False for omitted positions.
+An entry_present=True cell can still have absent fields; requested_fields tells
+callers which fields were selected. None alone does not prove a cell is blank or
+that an unrequested field does not exist. Explicit stringValue="" stays distinct
+when exposed. Formats, formula errors, and raw cell fields may contain sensitive,
+untrusted content and are excluded from representations, not stripped from the
+explicit result properties. Rich text, chips, images, links, notes, validations,
+and protection/filter metadata have no new typed P0 interface; unrelated properties
+are not modified.
+
+### Write safety and previews
+
+Pass optional `safety=WriteSafety(...)` to update_range, update_ranges,
+append_rows, clear_range, batch_update, and batch_structure. Value conveniences
+update_cell/update_cells/update_row/update_rows, clear_cell/clear_row,
+set_headers/rename_header forward the same keyword. Defaults and normal return
+types remain unchanged. Existing later-phase worksheet/column conveniences are
+preserved; they do not gain implicit protections. To validate a structural change
+without applying it, use batch_structure or batch_update with explicit safety.
+
+WriteSafety has preconditions (a tuple of WritePrecondition), protect_formulas
+(default False), and dry_run (default False). Applicable write permissions are
+checked by SheetsClient.validate_request before precondition/value reads. This
+uses the same transport preflight as execution, including spreadsheet scope,
+read/write API mode, operation grants, and structural/destructive restrictions.
+No credential acquisition, token refresh, HTTP request, or quota reservation is
+performed by client preflight itself. Service target resolution and precondition
+checks perform authorized metadata/value/grid reads as needed.
+
+WritePrecondition supports:
+
+- worksheet: optional exact title/numeric ID, otherwise the value operation's tab.
+- expected_sheet_id and expected_dimensions=(row_count, column_count): compare
+  fresh physical metadata, never a database identity.
+- region: an explicit range, defaulting to the single value-operation target.
+  Multiple targets and raw structural batches require an explicit region for
+  value/state checks; structural preconditions also need a worksheet selector.
+- expected_values: a full rectangular matrix matching that region, compared
+  against a padded read in read_mode (default UNFORMATTED_VALUE). None means no
+  value was exposed at that position, not a proven empty-cell type. Numeric values
+  are not stringified, and booleans do not compare equal to numeric 0/1.
+- expected_formula: an exact formula string for one cell. Use read_mode=FORMULA
+  with expected_values for multi-cell formula expectations.
+- expected_empty: an observable one-cell state. True means a reported cell entry
+  lacks both entered/effective value fields; False means value fields are present.
+  If the cell entry is omitted, either expectation fails rather than guessing.
+
+Every specified check must pass. Failed observations raise write_precondition_failed
+with outcome=validation_rejection and submit no mutation. Invalid precondition
+arguments have the existing service input/range errors. Conditions run before the
+entire mutation/batch, not between individual requests inside a structural batch.
+Explicit conditions may inspect another worksheet in the same spreadsheet through
+normal authorized reads; they do not grant broader spreadsheet access.
+
+protect_formulas checks reported userEnteredValue.formulaValue for cells the value
+mutation actually touches (null skips are excluded). It also supports explicit
+clear ranges. Its aggregate regions obey the read range/cell limits. A detected
+formula raises formula_overwrite_rejected. This policy
+does not alter input values, sanitize strings, rewrite formulas, or unmerge cells.
+It is unsupported for logical-table append and arbitrary structural changes:
+their physical overwrite targets cannot be established safely before execution.
+Append may still use explicit identity/dimension/range preconditions, but a table
+range check is not a promise about the final append row. Inspect the returned
+updated range after actual execution.
+
+With dry_run=True, no mutation is submitted. RequestPreview contains endpoint,
+method, spreadsheet ID, target range (when applicable), copied body/query data,
+and completed check names. Its outcome is validation_only, not confirmed_success.
+Body and target content are excluded from repr; inspect them only in a trusted
+review context. A preview is informational, cannot be executed as an authorization
+capability, and reserves/locks nothing. A later ordinary write reruns preflight.
+
+The generic batch_update accepts supported native Google request dictionaries;
+it does not replace the existing payload-free convenience methods. Basic numeric
+position/range checks and the client's request-type/grant checks apply. Structural
+previews resolve referenced sheet IDs against fresh metadata (or explicitly
+declared new IDs). Complete Google request-schema, merge, protected-range,
+resource-limit, and concurrent-editor validation still belongs to Google. Dry-run
+cannot guarantee that a later Google request will be accepted. Field masks must
+explicitly select intended mutation properties; raw structural payloads remain
+an administrative interface requiring explicit request-type grants.
+
+### Outcomes and remaining limits
+
+APIResponse.outcome is confirmed_success. APIClientError retains confirmed_failure,
+validation_rejection, or uncertain as appropriate; SheetServiceError now includes
+outcome and retryable=False. Service validation failures and stale-target/formula
+rejections require caller correction or re-resolution, not automatic retry.
+Credential/API errors retain their existing retryability metadata. The service
+never automatically replays a mutation, including append, insert, delete, or move.
+Success exposes Google's actual affected range/counts when available. A dry-run's
+validation_only is a separate non-executed state, not a fifth remote outcome.
+
+Value batches and structural batches retain their endpoint-specific contracts;
+the service does not claim identical rollback semantics or transactions across
+different calls. Null skips, explicit empty-string contents clearing, clear_values,
+and deletion remain distinct operations. RAW remains the literal-safe default;
+USER_ENTERED explicitly opts into Google's formula and locale parsing. Optional
+post-write verification is a separate read, not a permanence guarantee.
+
+Preconditions and formula checks are best-effort reads followed by writes. Other
+clients can insert, sort, rename, or change cells in the gap. These checks are not
+atomic compare-and-swap, isolation, oversell prevention, or stable row identity.
+Missing/unobservable data can cause a conservative rejection. No header layout or
+logical record is inferred, and no alternative target is guessed after a conflict.
+
+No authentication or execution/retry algorithm was rewritten for P0. Cache
+policies, distributed quota coordination, cancellation semantics, large-response
+chunking, hidden/filter state, validation/protection inspection, and other P1/P2
+utilities remain deferred; the pre-existing later-phase conveniences are retained.
+
+### Manual disposable-worksheet verification
+
+Run the offline verifier first:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python verify_sheet_service.py
+```
+
+The following manual command performs authorized reads and a preview only. It
+does not create tabs or write cells. If gSheet_Test is absent it stops; never
+substitute Sheet1. Browser consent, if needed, must be initiated explicitly first.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python - <<'PY'
+from pathlib import Path
+from gsheet import (GSheetConfig, CredentialManager, SheetsClient, SheetService,
+                    AuthorizationPolicy, OperationKind, WritePrecondition, WriteSafety)
+
+spreadsheet_id = '1h4d3qB90K2JZI5FbIAXRlQuc80WEoTPxh6t3I11FF9Y'
+config = GSheetConfig(dotenv_path=Path('.env').absolute())
+credentials = CredentialManager(config, connection_id='local-manual-test')
+policy = AuthorizationPolicy({spreadsheet_id}, {OperationKind.READ, OperationKind.WRITE})
+with SheetsClient(config, credentials, authorization=policy) as client:
+    service = SheetService(client, spreadsheet_id, limits=config.operations)
+    sheet = service.get_worksheet('gSheet_Test')
+    region = service.resolve_range(sheet.sheet_id, 'A1:C3', bounded=True)
+    current = service.read_range(sheet.sheet_id, region.region, read_mode='FORMULA', pad=True)
+    detail = service.get_grid_data(sheet.sheet_id, 'A1:C3', pad=True)
+    print('Read rows:', len(current.values), 'Grid cells:', len(detail.cells))
+    conditions = (WritePrecondition(expected_sheet_id=sheet.sheet_id,
+                    expected_dimensions=(sheet.row_count, sheet.column_count),
+                    expected_values=current.values, read_mode='FORMULA'),)
+    values = [['test', 'value', 'status'], ['gsheet', 1, 'OK'], ['oauth', 2, 'OK']]
+    preview = service.update_range(sheet.sheet_id, 'A1:C3', values,
+        safety=WriteSafety(preconditions=conditions, protect_formulas=True, dry_run=True))
+    print(preview.outcome, preview.method, preview.checks)
+    # Only after explicit approval, in a separate manual run:
+    # result = service.update_range(sheet.sheet_id, 'A1:C3', values,
+    #     safety=WriteSafety(preconditions=conditions, protect_formulas=True))
+    # print(result.outcome, result.data.get('updatedRange'), result.data.get('updatedCells'))
+    # service.read_range(sheet.sheet_id, 'A1:C3', pad=True)  # Separate readback.
+PY
+```
+
+Live append and batch tests should likewise inspect actual updated ranges on this
+disposable worksheet. Structural/destructive live tests need separate explicit
+approval, disposable targets, and the corresponding exact policy grants. The
+automated verifier uses only mocks and synthetic data; live P0 metadata masks and
+consent/permission behavior still require manual integration confirmation.

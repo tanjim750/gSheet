@@ -4,21 +4,24 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
+import re
 from typing import Any
 
-from ..client import APIResponse, SheetsClient
+from ..client import APIResponse, RequestPreview, SheetsClient, SheetsEndpoint
 from ..config import OperationalConfig
 from ..core.exceptions import ServiceErrorCode as Code, SheetServiceError
 from ..core.range_resolver import format_a1_range, index, parse_a1_range, quote_sheet_name
 from ..core.value_normalizer import value_matrix
-from ..models.operations import StructuralChange
-from ..models.ranges import CellRange
-from ..models.results import CellValue, RangeValues, ReadMode, WriteMode
+from ..models.operations import StructuralChange, WritePrecondition, WriteSafety
+from ..models.ranges import CellRange, ResolvedRange
+from ..models.cells import CellInfo
+from ..models.results import CellValue, GridDataResult, RangeValues, ReadMode, WriteMode
 from ..models.spreadsheet import WorksheetInfo
 
 Worksheet = str | int
 Range = str | CellRange
 _FIELDS = "spreadsheetId,properties,sheets(properties,merges)"
+_CELL_FIELDS = ("userEnteredValue", "effectiveValue", "formattedValue", "userEnteredFormat", "effectiveFormat")
 
 
 class SheetService:
@@ -89,6 +92,248 @@ class SheetService:
     def get_worksheet(self, worksheet: Worksheet) -> WorksheetInfo:
         return self._select(self.list_worksheets(), worksheet)
 
+    def resolve_range(self, worksheet: Worksheet, region: Range, *, bounded: bool = False) -> ResolvedRange:
+        """Keep unknown ends unless bounded=True explicitly requests fresh dimensions."""
+        if type(bounded) is not bool:
+            raise SheetServiceError(Code.INVALID_INPUT, field="bounded")
+        sheet = self.get_worksheet(worksheet)
+        original = region
+        if isinstance(region, str):
+            _, original = parse_a1_range(region)
+        resolved = self._region(sheet, region)  # Also validates known bounds/title.
+        return ResolvedRange(self._spreadsheet_id, sheet.sheet_id, sheet.title, resolved if bounded else original)
+
+    def get_merged_ranges(self, worksheet: Worksheet) -> tuple[ResolvedRange, ...]:
+        sheet = self.get_worksheet(worksheet)
+        return tuple(ResolvedRange(self._spreadsheet_id, sheet.sheet_id, sheet.title, merged)
+                     for merged in sheet.merged_ranges)
+
+    def get_grid_data(self, worksheet: Worksheet, region: Range, *,
+                      fields: Sequence[str] = _CELL_FIELDS, pad: bool = False) -> GridDataResult:
+        """Bounded CellData read; requested_fields and entry_present retain absence."""
+        if (type(pad) is not bool or not isinstance(fields, (tuple, list)) or not fields
+                or any(not isinstance(f, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*", f)
+                       or f.split(".")[0] not in _CELL_FIELDS for f in fields)
+                or len(set(fields)) != len(fields)):
+            raise SheetServiceError(Code.INVALID_INPUT, field="fields")
+        sheet = self.get_worksheet(worksheet)
+        if sheet.metadata.get("properties", {}).get("sheetType", "GRID") != "GRID":
+            raise SheetServiceError(Code.UNSUPPORTED_LAYOUT, field="worksheet")
+        bounded = self._region(sheet, region)
+        self._read_limit([bounded])
+        mask = ("spreadsheetId,properties(locale,timeZone),sheets(properties(sheetId,title),"
+                "data(startRow,startColumn,rowData(values(" + ",".join(fields) + "))))")
+        response = self._client.get_spreadsheet(self._spreadsheet_id, params={
+            "ranges": [format_a1_range(sheet.title, bounded)], "includeGridData": True, "fields": mask})
+        cells = {}
+        try:
+            payload = response.data
+            if payload.get("spreadsheetId") != self._spreadsheet_id:
+                raise ValueError
+            sheets = payload["sheets"]
+            if not isinstance(sheets, list) or len(sheets) != 1 or sheets[0]["properties"]["sheetId"] != sheet.sheet_id:
+                raise ValueError
+            data = sheets[0].get("data", [])
+            if not isinstance(data, list):
+                raise ValueError
+            for block in data:
+                start_row, start_column = block.get("startRow", 0), block.get("startColumn", 0)
+                if any(type(v) is not int or v < 0 for v in (start_row, start_column)):
+                    raise ValueError
+                rows = block.get("rowData", [])
+                if not isinstance(rows, list):
+                    raise ValueError
+                for r, row in enumerate(rows, start_row):
+                    values = row.get("values", [])
+                    if not isinstance(values, list):
+                        raise ValueError
+                    for c, value in enumerate(values, start_column):
+                        if (not isinstance(value, dict) or (r, c) in cells
+                                or not bounded.start_row <= r < bounded.end_row
+                                or not bounded.start_column <= c < bounded.end_column):
+                            raise ValueError
+                        for key in ("userEnteredValue", "effectiveValue", "userEnteredFormat", "effectiveFormat"):
+                            if key in value and not isinstance(value[key], dict):
+                                raise ValueError
+                        if "formattedValue" in value and not isinstance(value["formattedValue"], str):
+                            raise ValueError
+                        for key in ("userEnteredValue", "effectiveValue"):
+                            extended = value.get(key, {})
+                            if "stringValue" in extended and not isinstance(extended["stringValue"], str):
+                                raise ValueError
+                            if "boolValue" in extended and type(extended["boolValue"]) is not bool:
+                                raise ValueError
+                            if "numberValue" in extended:
+                                value_matrix([[extended["numberValue"]]], response=True)
+                                if type(extended["numberValue"]) not in (int, float):
+                                    raise ValueError
+                            if "formulaValue" in extended and not isinstance(extended["formulaValue"], str):
+                                raise ValueError
+                            if "errorValue" in extended and not isinstance(extended["errorValue"], dict):
+                                raise ValueError
+                        for key in ("userEnteredFormat", "effectiveFormat"):
+                            if "numberFormat" in value.get(key, {}) and not isinstance(value[key]["numberFormat"], dict):
+                                raise ValueError
+                        cells[r, c] = CellInfo(self._spreadsheet_id, sheet.sheet_id, r, c, True, tuple(fields),
+                            value.get("userEnteredValue"), value.get("effectiveValue"), value.get("formattedValue"),
+                            value.get("userEnteredFormat"), value.get("effectiveFormat"), value)
+            properties = payload.get("properties", {})
+            locale, timezone = properties.get("locale"), properties.get("timeZone")
+            if any(v is not None and not isinstance(v, str) for v in (locale, timezone)):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise SheetServiceError(Code.MALFORMED_RESPONSE, field="grid_data") from None
+        if pad:
+            for r in range(bounded.start_row, bounded.end_row):
+                for c in range(bounded.start_column, bounded.end_column):
+                    cells.setdefault((r, c), CellInfo(self._spreadsheet_id, sheet.sheet_id, r, c, False, tuple(fields)))
+        return GridDataResult(self._spreadsheet_id, sheet, bounded, tuple(cells[key] for key in sorted(cells)),
+                              locale, timezone, response)
+
+    def _write_guard(self, endpoint: SheetsEndpoint, *, sheet: WorksheetInfo | None,
+                     regions: Sequence[CellRange], body: dict[str, Any], range_name: str | None = None,
+                     params: dict[str, Any] | None = None, matrices: Sequence[list[list[CellValue]]] | None = None,
+                     clear: bool = False, safety: WriteSafety | None = None) -> RequestPreview | None:
+        if safety is None:
+            return None
+        if (not isinstance(safety, WriteSafety) or type(safety.dry_run) is not bool
+                or type(safety.protect_formulas) is not bool or not isinstance(safety.preconditions, tuple)
+                or not all(isinstance(p, WritePrecondition) for p in safety.preconditions)):
+            raise SheetServiceError(Code.INVALID_INPUT, field="safety")
+        preview = self._client.validate_request(endpoint, self._spreadsheet_id,
+            range_name=range_name, params=params, body=body)
+        checks = list(preview.checks) + (["target_resolution"] if sheet is not None else [])
+        if safety.protect_formulas and (sheet is None or matrices is None and not clear):
+            raise SheetServiceError(Code.UNSUPPORTED_LAYOUT, field="protect_formulas")
+        if safety.protect_formulas:
+            self._read_limit(regions)
+        for condition in safety.preconditions:
+            target = self.get_worksheet(condition.worksheet) if condition.worksheet is not None else sheet
+            if target is None:
+                raise SheetServiceError(Code.INVALID_INPUT, field="precondition_worksheet")
+            self._read_mode(condition.read_mode)
+            if condition.expected_sheet_id is not None:
+                index(condition.expected_sheet_id, "expected_sheet_id")
+                if condition.expected_sheet_id != target.sheet_id:
+                    raise SheetServiceError(Code.PRECONDITION_FAILED, field="worksheet_identity")
+            if condition.expected_dimensions is not None:
+                dimensions = condition.expected_dimensions
+                if not isinstance(dimensions, tuple) or len(dimensions) != 2:
+                    raise SheetServiceError(Code.INVALID_INPUT, field="expected_dimensions")
+                for size in dimensions:
+                    index(size, "expected_dimensions", positive=True)
+                if dimensions != (target.row_count, target.column_count):
+                    raise SheetServiceError(Code.PRECONDITION_FAILED, field="dimensions")
+            wants_values = condition.expected_values is not None
+            wants_grid = condition.expected_formula is not None or condition.expected_empty is not None
+            selected = condition.region
+            if selected is None and len(regions) == 1 and target.sheet_id == (sheet.sheet_id if sheet else None):
+                selected = regions[0]
+            if (wants_values or wants_grid) and selected is None:
+                raise SheetServiceError(Code.INVALID_INPUT, field="precondition_region")
+            if not (wants_values or wants_grid):
+                if condition.expected_sheet_id is None and condition.expected_dimensions is None:
+                    raise SheetServiceError(Code.INVALID_INPUT, field="precondition")
+                continue
+            bounded = self._region(target, selected)
+            if wants_values:
+                expected = value_matrix(condition.expected_values)
+                if len(expected) != bounded.end_row - bounded.start_row or any(
+                        len(row) != bounded.end_column - bounded.start_column for row in expected):
+                    raise SheetServiceError(Code.INVALID_RANGE, field="expected_values")
+                observed = self.read_range(target.sheet_id, bounded, read_mode=condition.read_mode, pad=True).values
+                if any(a != b or isinstance(a, bool) != isinstance(b, bool)
+                       for first, second in zip(expected, observed) for a, b in zip(first, second)):
+                    raise SheetServiceError(Code.PRECONDITION_FAILED, field="values")
+            if wants_grid:
+                if bounded.cell_count != 1 or (condition.expected_formula is not None and (
+                        not isinstance(condition.expected_formula, str) or not condition.expected_formula.startswith("="))) \
+                        or condition.expected_empty is not None and type(condition.expected_empty) is not bool:
+                    raise SheetServiceError(Code.INVALID_INPUT, field="cell_precondition")
+                observed = self.get_grid_data(target.sheet_id, bounded,
+                    fields=("userEnteredValue", "effectiveValue"), pad=True).cells[0]
+                if not observed.entry_present or (condition.expected_formula is not None and observed.formula != condition.expected_formula):
+                    raise SheetServiceError(Code.PRECONDITION_FAILED, field="cell_state")
+                empty = observed.user_entered_value is None and observed.effective_value is None
+                if condition.expected_empty is not None and condition.expected_empty != empty:
+                    raise SheetServiceError(Code.PRECONDITION_FAILED, field="empty_state")
+        if safety.preconditions:
+            checks.append("preconditions")
+        if safety.protect_formulas:
+            for offset, region in enumerate(regions):
+                reported = self.get_grid_data(sheet.sheet_id, region, fields=("userEnteredValue",)).cells
+                for cell in reported:
+                    r, c = cell.row - region.start_row, cell.column - region.start_column
+                    matrix = matrices[offset] if matrices is not None else []
+                    touched = clear or r < len(matrix) and c < len(matrix[r]) and matrix[r][c] is not None
+                    if touched and cell.formula is not None:
+                        raise SheetServiceError(Code.FORMULA_PROTECTED, field="formula")
+            checks.append("formula_protection")
+        return replace(preview, checks=tuple(checks)) if safety.dry_run else None
+
+    def batch_update(self, requests: Sequence[dict[str, Any]], *, safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
+        """Restricted raw structural foundation; client validates grants and types.
+
+        Preconditions need explicit worksheet selectors. Formula protection is
+        unsupported for raw structural mutations whose effects cannot be resolved.
+        """
+        if not isinstance(requests, (tuple, list)) or not requests:
+            raise SheetServiceError(Code.INVALID_INPUT, field="requests")
+        if any(not isinstance(request, dict) or len(request) != 1
+               or not isinstance(next(iter(request.values())), dict) for request in requests):
+            raise SheetServiceError(Code.INVALID_INPUT, field="requests")
+
+        def validate_positions(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in ("sheetId", "sourceSheetId", "newSheetId", "startRowIndex", "startColumnIndex", "startIndex", "destinationIndex"):
+                        index(item, key)
+                    if key in ("endRowIndex", "endColumnIndex", "endIndex", "rowCount", "columnCount", "length"):
+                        index(item, key, positive=True)
+                    validate_positions(item)
+                for start, end in (("startRowIndex", "endRowIndex"), ("startColumnIndex", "endColumnIndex"), ("startIndex", "endIndex")):
+                    if end in value and value.get(start, 0) >= value[end]:
+                        raise SheetServiceError(Code.INVALID_RANGE, field="requests")
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    validate_positions(item)
+        try:
+            validate_positions(requests)
+        except RecursionError:
+            raise SheetServiceError(Code.INVALID_INPUT, field="requests") from None
+        body = {"requests": list(requests)}
+        preview = self._write_guard(SheetsEndpoint.SPREADSHEET_BATCH_UPDATE, sheet=None, regions=[], body=body, safety=safety)
+        if preview is not None:
+            known = {sheet.sheet_id for sheet in self.list_worksheets()}
+            declared = set()
+            for request in preview.body["requests"]:
+                properties = request.get("addSheet", {}).get("properties", {})
+                if not isinstance(properties, dict):
+                    raise SheetServiceError(Code.INVALID_INPUT, field="properties")
+                new_id = properties.get("sheetId")
+                if new_id is None:
+                    new_id = request.get("duplicateSheet", {}).get("newSheetId")
+                if new_id is not None:
+                    index(new_id, "new_sheet_id")
+                    if new_id in known or new_id in declared:
+                        raise SheetServiceError(Code.INVALID_INPUT, field="new_sheet_id")
+                    declared.add(new_id)
+
+            def verify_ids(value: Any) -> None:
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if key in ("sheetId", "sourceSheetId"):
+                            index(item, "sheet_id")
+                            if item not in known | declared:
+                                raise SheetServiceError(Code.WORKSHEET_NOT_FOUND, field="sheet_id")
+                        verify_ids(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        verify_ids(item)
+            verify_ids(preview.body)
+            return replace(preview, checks=preview.checks + ("worksheet_ids",))
+        return self._client.batch_update(self._spreadsheet_id, body)
+
     def worksheet_exists(self, worksheet: Worksheet) -> bool:
         try:
             self.get_worksheet(worksheet)
@@ -104,8 +349,8 @@ class SheetService:
         if any(sheet.title == title and sheet.sheet_id != except_id for sheet in worksheets):
             raise SheetServiceError(Code.INVALID_INPUT, field="title")
 
-    def _structural(self, requests: list[dict[str, Any]]) -> APIResponse:
-        return self._client.batch_update(self._spreadsheet_id, {"requests": requests})
+    def _structural(self, requests: list[dict[str, Any]], *, safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
+        return self.batch_update(requests, safety=safety)
 
     def create_worksheet(self, title: str, *, rows: int | None = None, columns: int | None = None) -> APIResponse:
         self._new_title(title, self.list_worksheets())
@@ -223,16 +468,21 @@ class SheetService:
         return matrix
 
     def update_range(self, worksheet: Worksheet, region: Range, values: Sequence[Sequence[CellValue]], *,
-                     write_mode: WriteMode = "RAW") -> APIResponse:
+                     write_mode: WriteMode = "RAW", safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
         self._write_mode(write_mode)
         sheet = self.get_worksheet(worksheet)
         bounded = self._region(sheet, region)
         matrix = self._write_values(sheet, bounded, values)
+        preview = self._write_guard(SheetsEndpoint.VALUES_UPDATE, sheet=sheet, regions=[bounded],
+            range_name=format_a1_range(sheet.title, bounded), body={"values": matrix},
+            params={"valueInputOption": write_mode}, matrices=[matrix], safety=safety)
+        if preview is not None:
+            return preview
         return self._client.update_values(self._spreadsheet_id, format_a1_range(sheet.title, bounded),
                                          {"values": matrix}, params={"valueInputOption": write_mode})
 
     def update_ranges(self, worksheet: Worksheet, updates: Sequence[tuple[Range, Sequence[Sequence[CellValue]]]], *,
-                      write_mode: WriteMode = "RAW") -> APIResponse:
+                      write_mode: WriteMode = "RAW", safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
         self._write_mode(write_mode)
         if not isinstance(updates, (list, tuple)) or not updates or len(updates) > self._limits.max_write_batch_ranges:
             raise SheetServiceError(Code.INVALID_INPUT, field="updates")
@@ -250,30 +500,37 @@ class SheetService:
             regions.append(bounded)
             data.append({"range": format_a1_range(sheet.title, bounded),
                          "values": self._write_values(sheet, bounded, update[1])})
-        return self._client.batch_update_values(self._spreadsheet_id, {"valueInputOption": write_mode, "data": data})
+        body = {"valueInputOption": write_mode, "data": data}
+        preview = self._write_guard(SheetsEndpoint.VALUES_BATCH_UPDATE, sheet=sheet, regions=regions,
+            body=body, matrices=[item["values"] for item in data], safety=safety)
+        return preview if preview is not None else self._client.batch_update_values(self._spreadsheet_id, body)
 
-    def clear_range(self, worksheet: Worksheet, region: Range) -> APIResponse:
+    def clear_range(self, worksheet: Worksheet, region: Range, *, safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
         sheet = self.get_worksheet(worksheet)
-        return self._client.clear_values(self._spreadsheet_id, format_a1_range(sheet.title, self._region(sheet, region)))
+        bounded = self._region(sheet, region)
+        target = format_a1_range(sheet.title, bounded)
+        preview = self._write_guard(SheetsEndpoint.VALUES_CLEAR, sheet=sheet, regions=[bounded],
+                                    range_name=target, body={}, clear=True, safety=safety)
+        return preview if preview is not None else self._client.clear_values(self._spreadsheet_id, target)
 
     def read_cell(self, worksheet: Worksheet, row: int, column: int, *, read_mode: ReadMode = "FORMATTED_VALUE") -> CellValue:
         return self.read_range(worksheet, CellRange(row, column, index(row, "row") + 1,
                                index(column, "column") + 1), read_mode=read_mode, pad=True).values[0][0]
 
     def update_cell(self, worksheet: Worksheet, row: int, column: int, value: CellValue, *,
-                    write_mode: WriteMode = "RAW") -> APIResponse:
+                    write_mode: WriteMode = "RAW", safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
         return self.update_range(worksheet, CellRange(row, column, index(row, "row") + 1,
-                                 index(column, "column") + 1), [[value]], write_mode=write_mode)
+                                 index(column, "column") + 1), [[value]], write_mode=write_mode, safety=safety)
 
-    def clear_cell(self, worksheet: Worksheet, row: int, column: int) -> APIResponse:
-        return self.clear_range(worksheet, CellRange(row, column, index(row, "row") + 1, index(column, "column") + 1))
+    def clear_cell(self, worksheet: Worksheet, row: int, column: int, *, safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
+        return self.clear_range(worksheet, CellRange(row, column, index(row, "row") + 1, index(column, "column") + 1), safety=safety)
 
     def update_cells(self, worksheet: Worksheet, updates: Sequence[tuple[int, int, CellValue]], *,
-                     write_mode: WriteMode = "RAW") -> APIResponse:
+                     write_mode: WriteMode = "RAW", safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
         if not isinstance(updates, (list, tuple)) or any(not isinstance(item, (list, tuple)) or len(item) != 3 for item in updates):
             raise SheetServiceError(Code.INVALID_INPUT, field="updates")
         return self.update_ranges(worksheet, [(CellRange(r, c, index(r, "row") + 1, index(c, "column") + 1), [[value]])
-                                              for r, c, value in updates], write_mode=write_mode)
+                                              for r, c, value in updates], write_mode=write_mode, safety=safety)
 
     def read_rows(self, worksheet: Worksheet, start_row: int, end_row: int | None = None, *,
                   start_column: int = 0, end_column: int | None = None,
@@ -286,29 +543,37 @@ class SheetService:
                               end_column=end_column, read_mode=read_mode, pad=pad)
 
     def update_rows(self, worksheet: Worksheet, start_row: int, values: Sequence[Sequence[CellValue]], *,
-                    start_column: int = 0, write_mode: WriteMode = "RAW") -> APIResponse:
+                    start_column: int = 0, write_mode: WriteMode = "RAW",
+                    safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
         matrix = value_matrix(values)
         return self.update_range(worksheet, CellRange(start_row, start_column,
-            index(start_row, "row") + len(matrix), index(start_column, "column") + max(map(len, matrix))), matrix, write_mode=write_mode)
+            index(start_row, "row") + len(matrix), index(start_column, "column") + max(map(len, matrix))), matrix, write_mode=write_mode, safety=safety)
 
     def update_row(self, worksheet: Worksheet, row: int, values: Sequence[CellValue], *,
-                   start_column: int = 0, write_mode: WriteMode = "RAW") -> APIResponse:
-        return self.update_rows(worksheet, row, [values], start_column=start_column, write_mode=write_mode)
+                   start_column: int = 0, write_mode: WriteMode = "RAW",
+                   safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
+        return self.update_rows(worksheet, row, [values], start_column=start_column, write_mode=write_mode, safety=safety)
 
     def append_rows(self, worksheet: Worksheet, values: Sequence[Sequence[CellValue]], *,
-                    table_range: Range, write_mode: WriteMode = "RAW") -> APIResponse:
+                    table_range: Range, write_mode: WriteMode = "RAW",
+                    safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
         self._write_mode(write_mode)
         sheet = self.get_worksheet(worksheet)
         bounded = self._region(sheet, table_range)
         matrix = value_matrix(values)
         if any(len(row) > bounded.end_column - bounded.start_column for row in matrix):
             raise SheetServiceError(Code.INVALID_RANGE, field="values")
+        preview = self._write_guard(SheetsEndpoint.VALUES_APPEND, sheet=sheet, regions=[bounded],
+            range_name=format_a1_range(sheet.title, bounded), body={"values": matrix},
+            params={"valueInputOption": write_mode}, safety=safety)
+        if preview is not None:
+            return preview
         return self._client.append_values(self._spreadsheet_id, format_a1_range(sheet.title, bounded),
                                          {"values": matrix}, params={"valueInputOption": write_mode})
 
     def clear_row(self, worksheet: Worksheet, row: int, *, start_column: int = 0,
-                  end_column: int | None = None) -> APIResponse:
-        return self.clear_range(worksheet, CellRange(row, start_column, index(row, "row") + 1, end_column))
+                  end_column: int | None = None, safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
+        return self.clear_range(worksheet, CellRange(row, start_column, index(row, "row") + 1, end_column), safety=safety)
 
     def find_rows(self, worksheet: Worksheet, column: int, value: CellValue, *, start_row: int,
                   end_row: int, read_mode: ReadMode = "UNFORMATTED_VALUE") -> list[int]:
@@ -325,8 +590,9 @@ class SheetService:
                               start_column=start_column, end_column=end_column, read_mode=read_mode, pad=True)
 
     def set_headers(self, worksheet: Worksheet, headers: Sequence[CellValue], *, header_row: int,
-                    start_column: int = 0, write_mode: WriteMode = "RAW") -> APIResponse:
-        return self.update_row(worksheet, header_row, headers, start_column=start_column, write_mode=write_mode)
+                    start_column: int = 0, write_mode: WriteMode = "RAW",
+                    safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
+        return self.update_row(worksheet, header_row, headers, start_column=start_column, write_mode=write_mode, safety=safety)
 
     def find_columns(self, worksheet: Worksheet, header: str, *, header_row: int,
                      start_column: int = 0, end_column: int | None = None) -> list[int]:
@@ -349,11 +615,11 @@ class SheetService:
 
     def rename_header(self, worksheet: Worksheet, header: str, new_header: CellValue, *,
                       header_row: int, occurrence: int | None = None,
-                      write_mode: WriteMode = "RAW") -> APIResponse:
+                      write_mode: WriteMode = "RAW", safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
         column = self.find_column(worksheet, header, header_row=header_row, occurrence=occurrence)
-        return self.update_cell(worksheet, header_row, column, new_header, write_mode=write_mode)
+        return self.update_cell(worksheet, header_row, column, new_header, write_mode=write_mode, safety=safety)
 
-    def batch_structure(self, changes: Sequence[StructuralChange]) -> APIResponse:
+    def batch_structure(self, changes: Sequence[StructuralChange], *, safety: WriteSafety | None = None) -> APIResponse | RequestPreview:
         if not isinstance(changes, (list, tuple)) or not changes:
             raise SheetServiceError(Code.INVALID_INPUT, field="changes")
         sheets = self.list_worksheets()
@@ -397,7 +663,7 @@ class SheetService:
                     requests.append({"moveDimension": {"source": span, "destinationIndex": destination}})
             updated = replace(sheet, **({"row_count": size} if dimension == "ROWS" else {"column_count": size}))
             sheets = [updated if value.sheet_id == sheet.sheet_id else value for value in sheets]
-        return self._structural(requests)
+        return self._structural(requests, safety=safety)
 
     def insert_rows(self, worksheet: Worksheet, start: int, count: int = 1, *, inherit_from_before: bool = False) -> APIResponse:
         return self.batch_structure([StructuralChange("insert_rows", worksheet, start=start, count=count, inherit_from_before=inherit_from_before)])

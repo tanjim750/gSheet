@@ -28,7 +28,7 @@ from google.auth.exceptions import GoogleAuthError
 from requests import Session
 from requests.adapters import HTTPAdapter
 from requests.exceptions import (
-    ChunkedEncodingError, ConnectionError, ContentDecodingError, RequestException,
+    ChunkedEncodingError, ConnectionError, ConnectTimeout, ContentDecodingError, RequestException,
     SSLError, Timeout,
 )
 
@@ -396,6 +396,7 @@ class SheetsTransport:
                 hint = None
                 payload = None
                 status = None
+                not_submitted = False
                 try:
                     with _quiet_auth_logging():
                         headers: dict[str, str] = {}
@@ -421,6 +422,9 @@ class SheetsTransport:
                             category = "timeout"
                         elif status in {500, 502, 503, 504}:
                             category = "temporary_upstream"
+                except ConnectTimeout:
+                    failure, category = Code.TIMEOUT, "timeout"
+                    not_submitted = True  # Connection establishment failed before submission.
                 except Timeout:
                     failure, category = Code.TIMEOUT, "timeout"
                 except SSLError:
@@ -438,7 +442,7 @@ class SheetsTransport:
                         response.close()
                     self._session.cookies.clear()
                 elapsed = time.monotonic() - start
-                uncertain = failure is not None and not read and (
+                uncertain = failure is not None and not read and not not_submitted and (
                     failure in {Code.TIMEOUT, Code.TRANSPORT, Code.MALFORMED_RESPONSE}
                     or status is not None and status >= 500
                     or status is not None and 300 <= status < 400)
