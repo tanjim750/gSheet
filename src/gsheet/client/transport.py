@@ -13,7 +13,6 @@ import logging
 import math
 import time
 import uuid
-from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -37,6 +36,7 @@ from ..auth.credentials import _quiet_auth_logging
 from ..config import ConfigurationError, GSheetConfig
 from ..core.exceptions import APIClientError, APIErrorCode as Code, APIErrorReason, APIErrorSource
 from ..core.permissions import AuthorizationPolicy, OperationKind as Op
+from ..core.limits import reserve
 
 
 class SheetsEndpoint(StrEnum):
@@ -136,6 +136,8 @@ class APIResponse:
     request_id: str
     attempts: int
     elapsed_seconds: float
+    cache_hit: bool = False
+    cache_age_seconds: float = 0.0
 
     @property
     def outcome(self) -> str:
@@ -161,7 +163,7 @@ class SheetsTransport:
 
     Construction performs no auth or network work. Authorization defaults deny
     all. Trusted callers must use the matching connection's config/manager/policy.
-    Local rolling-minute budgets do not coordinate projects across processes.
+    Local rolling-minute budgets share project counters within this process.
     A full local budget fails immediately with retry_after_seconds (backpressure).
     """
 
@@ -183,7 +185,6 @@ class SheetsTransport:
         self._session.headers.update({"Accept": "application/json", "User-Agent": app or "gsheet/0.1.0"})
         self._lock = RLock()
         self._closed = False
-        self._history: dict[str, deque[float]] = {"read": deque(), "write": deque()}
         self._random = Random()
         # Instance-local level; no changes to application/global logger settings.
         self._logger = logging.Logger("gsheet.client.transport", level=config.operations.logging_level)
@@ -317,20 +318,8 @@ class SheetsTransport:
         return method, url, query, data, read
 
     def _budget(self, read: bool, request_id: str, attempts: int) -> None:
-        settings = self._config.operations
-        if not settings.throttling_enabled:
-            return
-        kind = "read" if read else "write"
-        limit = min(getattr(settings, f"{kind}_requests_per_minute_per_project"),
-                    getattr(settings, f"{kind}_requests_per_minute_per_user"))
-        history = self._history[kind]
-        now = time.monotonic()
-        while history and history[0] <= now - 60:
-            history.popleft()
-        if len(history) >= limit:
-            raise APIClientError(Code.THROTTLED, retryable=True, attempts=attempts,
-                                 request_id=request_id, retry_after_seconds=max(0.0, 60 - (now - history[0])))
-        history.append(now)
+        reserve(self._config.operations, self._credentials, read=read,
+                request_id=request_id, attempts=attempts)
 
     def _delay(self, attempt: int) -> float:
         settings = self._config.retry
@@ -404,14 +393,29 @@ class SheetsTransport:
                         self._session.cookies.clear()
                         response = self._session.request(method, url, params=query, json=data,
                             headers=headers, timeout=self._config.api.request_timeout_seconds,
-                            allow_redirects=False)
+                            allow_redirects=False, stream=True)
                         status = response.status_code
                         hint = self._retry_after(response.headers.get("Retry-After"))
+                        chunks = []
+                        size = 0
+                        # iter_content counts decoded bytes, including compressed responses.
+                        for chunk in response.iter_content(chunk_size=65_536):
+                            size += len(chunk)
+                            if size > self._config.operations.max_response_bytes:
+                                failure = Code.RESPONSE_TOO_LARGE
+                                break
+                            chunks.append(chunk)
                         try:
-                            payload = response.json() if status != 204 else {}
-                        except (ValueError, RecursionError):
+                            if failure is None:
+                                payload = json.loads(b"".join(chunks)) if status != 204 else {}
+                        except (ValueError, UnicodeError, RecursionError):
                             payload = None
-                    if 200 <= status < 300:
+                    if failure == Code.RESPONSE_TOO_LARGE:
+                        # A known upstream rejection remains a confirmed failure,
+                        # even if its body exceeds our local inspection bound.
+                        if 400 <= status < 500:
+                            failure = self._http_error(status, None)
+                    elif 200 <= status < 300:
                         if not isinstance(payload, dict) or "error" in payload:
                             failure = Code.MALFORMED_RESPONSE
                     else:
@@ -443,7 +447,7 @@ class SheetsTransport:
                     self._session.cookies.clear()
                 elapsed = time.monotonic() - start
                 uncertain = failure is not None and not read and not not_submitted and (
-                    failure in {Code.TIMEOUT, Code.TRANSPORT, Code.MALFORMED_RESPONSE}
+                    failure in {Code.TIMEOUT, Code.TRANSPORT, Code.MALFORMED_RESPONSE, Code.RESPONSE_TOO_LARGE}
                     or status is not None and status >= 500
                     or status is not None and 300 <= status < 400)
                 self._observe(endpoint, spreadsheet_id, request_id, attempts, start, status,
@@ -460,7 +464,8 @@ class SheetsTransport:
                     time.sleep(max(self._delay(attempts), hint or 0))
                     continue
                 raise APIClientError(failure, status_code=status, retryable=retryable,
-                                     attempts=attempts, request_id=request_id, retry_after_seconds=hint)
+                                     attempts=attempts, request_id=request_id, retry_after_seconds=hint,
+                                     source=APIErrorSource.TRANSPORT if failure == Code.RESPONSE_TOO_LARGE else None)
 
     @staticmethod
     def _http_error(status: int, payload: Any) -> Code:
