@@ -2,7 +2,8 @@
 .env.*
 !.env.example
 gsheet-scaffold.txt
-docs
+docs/*
+!docs/gSheet_Service_Requirements.md
 
 # Store local credentials and OAuth tokens here, or outside the repository.
 .credentials/
@@ -13,3 +14,18 @@ client_secret*.json
 token.json
 tokens.json
 reports/
+
+# Local Python environments and generated distribution/build artifacts.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store

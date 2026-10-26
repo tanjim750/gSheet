@@ -1,5 +1,0 @@
-google-auth[requests]<3,>=2.38
-google-auth-oauthlib<2,>=1.2
-
-[dotenv]
-python-dotenv<2,>=1.0

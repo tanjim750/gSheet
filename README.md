@@ -1,9 +1,95 @@
 # gSheet
 
-Generic Python Google Sheets service foundation. Configuration, authentication,
+Generic Python Google Sheets library, release **1.1.0**, implementing
+the service requirements specification **v1.1**. Configuration, authentication,
 the low-level Sheets API client, and the generic SheetService are implemented.
 Repositories, the facade, and business-specific wrappers remain unimplemented.
 Python 3.11+ is required.
+
+## Installation and first use
+
+Install from this checkout, or from an approved local wheel. This release has
+not been published to a package registry:
+
+```sh
+python -m pip install .
+# Optional explicit .env loading:
+python -m pip install '.[dotenv]'
+# Or install the locally built distribution:
+python -m pip install /path/to/gsheet-1.1.0-py3-none-any.whl
+```
+
+The distribution/import name is `gsheet`. Runtime dependencies are
+`google-auth[requests]>=2.38,<3` (including the requests HTTP transport) and
+`google-auth-oauthlib>=1.2,<2`; the optional dotenv extra is
+`python-dotenv>=1.0,<2`. Inspect the installed version with
+`importlib.metadata.version("gsheet")`. Python 3.11 is the minimum; the release
+audit records the interpreters and dependency versions actually exercised.
+Source builds use setuptools 77 or newer for the declared SPDX license metadata;
+installing a wheel does not require this build backend.
+
+Enable the **Google Sheets API** in the credentials' Google Cloud project. For a
+service account, explicitly share the spreadsheet with its email and grant the
+appropriate Google file permissions. For OAuth, configure an installed/desktop
+application client and consent access for the intended account. Local operation
+grants, configured scopes, Google's consent grant and file permissions must all
+permit the request. No Drive discovery endpoint is required for an explicit ID.
+
+The following read example assumes a real credential file and an authorized
+spreadsheet ID supplied by the trusted application:
+
+```python
+from pathlib import Path
+from gsheet import (
+    APIConfig, AuthConfig, AuthorizationPolicy, CredentialManager, GSheetConfig,
+    OperationKind, SheetService, SheetsClient, WriteSafety,
+)
+
+spreadsheet_id = "YOUR_AUTHORIZED_SPREADSHEET_ID"
+config = GSheetConfig(
+    api=APIConfig(access_mode="read_only"),
+    auth=AuthConfig(mode="service_account",
+                    service_account_file=Path("/secure/service-account.json")),
+    environ={},
+)
+credentials = CredentialManager(config, connection_id="application-connection")
+policy = AuthorizationPolicy({spreadsheet_id}, {OperationKind.READ})
+with SheetsClient(config, credentials, authorization=policy) as client:
+    service = SheetService(client, spreadsheet_id, limits=config.operations)
+    worksheets = service.list_worksheets()
+    # Select an exact known title or numeric sheet ID; no default tab is assumed.
+    cells = service.read_range("Data", "A1:C3", pad=True)
+```
+
+For writes using that service-account identity, deliberately construct read/write
+configuration and grants. This example previews a RAW write; executing the same
+method with `dry_run=False` submits it. Never treat a preview as a lock:
+
+```python
+write_config = GSheetConfig(api=APIConfig(access_mode="read_write"),
+                           auth=config.auth, environ={})
+write_credentials = CredentialManager(write_config,
+                                     connection_id="application-connection")
+write_policy = AuthorizationPolicy(
+    {spreadsheet_id}, {OperationKind.READ, OperationKind.WRITE})
+with SheetsClient(write_config, write_credentials,
+                  authorization=write_policy) as client:
+    service = SheetService(client, spreadsheet_id, limits=write_config.operations)
+    preview = service.update_range("Data", "A1:B1", [["=literal text", 42]],
+        safety=WriteSafety(protect_formulas=True, dry_run=True))
+```
+
+For OAuth instead, configure `AuthConfig(mode="oauth", oauth_client_file=...,
+oauth_token_file=...)` with private, connection-specific storage as described
+below. Only an explicit `credentials.authorize_interactively(allow_browser=True)`
+starts consent. After scope changes use explicit `reauthorize=True`; a stored
+read-only grant is not silently upgraded. A service-account key needs no browser.
+
+For structured failures, catch `ConfigurationError`, `AuthenticationError`,
+`APIClientError`, or `SheetServiceError` and inspect their safe `to_dict()` output.
+An uncertain write must be reconciled with a separate read before any retry.
+See [release notes](CHANGELOG.md), the [v1.1 specification](docs/gSheet_Service_Requirements.md)
+and the [MIT license](LICENSE) ([OSI text](https://opensource.org/license/mit)).
 
 ## Configuration
 
@@ -38,7 +124,7 @@ Public lifecycle methods:
   need without contacting Google. Local validity does not detect remote revocation.
 - `requires_interactive_authorization()` initializes locally if necessary and
   reports whether OAuth interaction is needed.
-- `get_credentials()` returns a sensitive Google-compatible object to the future
+- `get_credentials()` returns a sensitive Google-compatible object to the
   API client, refreshing on demand if enabled and required. It never starts
   OAuth interaction. Do not expose returned objects through tools, logs, or JSON.
 - `refresh()` explicitly refreshes credentials over HTTPS, using the configured
@@ -291,8 +377,8 @@ owner's approval.
 
 ## Generic Sheet Service
 
-The dependency flow is business wrapper → SheetService → SheetsClient → Google
-Sheets API. One coherent service uses focused range/value utilities and small
+The dependency flow is business wrapper → SheetService → SheetsClient →
+SheetsTransport → Google Sheets API. One coherent service uses focused range/value utilities and small
 physical-grid/result types. It does not implement repositories, the facade,
 schema discovery, business entities, or database identity.
 
@@ -448,12 +534,13 @@ permutation of the absolute column indexes in one contiguous block, preserves
 columns outside that block, and generates ordered moveDimension requests.
 
 `StructuralChange` describes insert_rows, delete_rows, insert_columns,
-delete_columns, add_columns, or move_columns, with worksheet, start/end, count,
+delete_columns, add_columns, move_rows, or move_columns, with worksheet, start/end, count,
 destination, and inheritance arguments as relevant. batch_structure resolves
 metadata once and validates changes in order, tracking dimensions after previous
 changes. Callers express later indexes in that resulting grid. It submits one
 structural API batch. Worksheet create/rename/delete/duplicate remain separate
-methods; arbitrary raw structural payload orchestration stays in SheetsClient.
+methods. Trusted administrative native payloads can use the restricted
+`batch_update` on SheetService or SheetsClient.
 
 Noncontiguous reads/writes and cell updates use the values batch endpoints.
 Write regions must not overlap. Read/write range counts honor service limits;
@@ -673,9 +760,10 @@ with the optional utilities documented in its own section.
 The v1.1 P1 scope is Sections 14 Phase 2, 21, 22 and 23 Phase 2. Clearing and
 dimension insertion/deletion were already implemented; they are reused rather
 than replaced. Existing `update_cell`/`update_row` conveniences are also retained.
-The additions below are implementation only and have not been tested in this
-milestone. Section 22's additional test scenarios are deferred to a separate
-testing task. Existing verification scripts and reports are unchanged.
+The P1 manual tests and stabilization checks passed; the historical reports under
+`reports/` record the original verifier callback issue and its closure. The final
+release audit reruns the available offline checks. These reports are local audit
+artifacts and are excluded from distributions.
 
 ### Targeted reads and result contracts
 
@@ -870,8 +958,8 @@ retry has been introduced.
 Native shapes follow Google's [Sheet/GridData reference](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/sheets)
 and [batch request reference](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/request).
 Application byte/cell bounds are independent of Google's [quota policy](https://developers.google.com/workspace/sheets/api/limits).
-P0/P1 verification results are recorded separately under `reports/`. P2 additions
-below are implementation only and have not been verified in this milestone.
+P0/P1 verification results are recorded separately under `reports/`; P2 manual
+verification and the final release audit are recorded there as well.
 
 ## P2 optional utilities
 
@@ -969,7 +1057,12 @@ constraints are ultimately validated by Google. Dropdown lists use ONE_OF_LIST,
 range dropdowns ONE_OF_RANGE, and custom formula rules CUSTOM_FORMULA; rule
 formulas and references are an explicit caller-selected policy. Checkbox/BOOLEAN
 rules can populate an unchecked FALSE value, as observed during P1 fixture setup.
-Removing a rule does not imply clearing its cell values. Include filtered rows
+Removing a rule does not imply clearing its cell values. Live verification also
+observed Google accepting programmatic USER_ENTERED values that violated both a
+strict list rule and a warning-only numeric rule. Stored validation is not a
+separate service-side value-validation engine or a guarantee of API rejection.
+Native CellFormat semantics are likewise Google-validated; for example, Google
+accepted and returned a negative fontSize during verification. Include filtered rows
 only with filtered_rows_included=True; this does not change the filter definition.
 
 `set_column_width(worksheet, start, end, width, safety=None)` and
@@ -1047,10 +1140,12 @@ client. Every mutation still receives one HTTP attempt; timeout/ambiguous result
 remain uncertain and are never automatically replayed. Errors remain sanitized
 and structured. Native Google schema/protection restrictions still apply.
 
-P2 implementation has not been tested in this milestone. No offline verification
-suite or live Sheets API operation was run, and existing verification reports
-and scripts were not modified. Separate manual verification is required before
-claiming P2 readiness.
+P2 manual verification passed for the documented contract, including all seven
+paste modes, moves, scoped metadata, exact search and same-file copies. The two
+explicitly approved temporary copies were deleted by their returned IDs, and the
+full spreadsheet baseline was restored. See `reports/P2_MANUAL_TEST_REPORT.md`
+and its evidence for limitations and corrected utility expectations. The final
+release audit uses offline checks; it does not repeat live mutations.
 
 ### Manual disposable-worksheet verification
 
@@ -1099,5 +1194,6 @@ PY
 Live append and batch tests should likewise inspect actual updated ranges on this
 disposable worksheet. Structural/destructive live tests need separate explicit
 approval, disposable targets, and the corresponding exact policy grants. The
-automated verifier uses only mocks and synthetic data; live P0 metadata masks and
-consent/permission behavior still require manual integration confirmation.
+automated verifier uses only mocks and synthetic data. Prior live verification
+covered the recorded OAuth account and GRID test worksheet; each deployment must
+still confirm its own consent, file permissions and target identities.

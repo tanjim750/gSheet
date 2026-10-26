@@ -1,0 +1,10 @@
+include README.md LICENSE CHANGELOG.md .env.example
+include docs/gSheet_Service_Requirements.md
+include verify_sheet_service.py
+recursive-include src/gsheet *.py
+prune .credentials
+prune .venv
+prune reports
+prune build
+prune dist
+global-exclude __pycache__ *.py[cod] .DS_Store
