@@ -30,3 +30,8 @@ class CellInfo:
     @property
     def number_format(self) -> dict[str, Any] | None:
         return (self.effective_format or {}).get("numberFormat", (self.user_entered_format or {}).get("numberFormat"))
+
+    @property
+    def data_validation(self) -> dict[str, Any] | None:
+        """Native validation rule only when requested and returned by Google."""
+        return self.raw.get("dataValidation")

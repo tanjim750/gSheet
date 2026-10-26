@@ -9,7 +9,7 @@ from .ranges import CellRange
 
 @dataclass(frozen=True)
 class StructuralChange:
-    operation: Literal["insert_rows", "delete_rows", "insert_columns", "delete_columns", "add_columns", "move_columns"]
+    operation: Literal["insert_rows", "delete_rows", "insert_columns", "delete_columns", "add_columns", "move_rows", "move_columns"]
     worksheet: str | int
     start: int = 0
     end: int | None = None

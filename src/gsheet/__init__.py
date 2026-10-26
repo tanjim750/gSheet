@@ -20,6 +20,7 @@ from .core.range_resolver import (
 )
 from .models import (CellInfo, CellRange, CellValue, GridDataResult, RangeValues, ReadMode,
                      ResolvedRange, StructuralChange, WorksheetInfo, WriteMode, WritePrecondition, WriteSafety)
+from .models import DeveloperMetadataResult, DimensionInfo, DimensionsResult, WorksheetMetadata
 from .services import SheetService
 
 __all__ = [
@@ -33,5 +34,6 @@ __all__ = [
     "CellValue", "ReadMode", "WriteMode",
     "CellInfo", "GridDataResult", "RequestPreview", "ResolvedRange", "WritePrecondition", "WriteSafety",
     "StructuralChange", "WorksheetInfo", "column_a1_to_index", "column_index_to_a1",
+    "DeveloperMetadataResult", "DimensionInfo", "DimensionsResult", "WorksheetMetadata",
     "format_a1_range", "parse_a1_range", "quote_sheet_name", "row_a1_to_index", "row_index_to_a1",
 ]

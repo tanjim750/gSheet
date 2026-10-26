@@ -62,6 +62,7 @@ class APIErrorCode(StrEnum):
     TRANSPORT = "transport_failure"
     UPSTREAM = "upstream_failure"
     MALFORMED_RESPONSE = "malformed_response"
+    RESPONSE_TOO_LARGE = "response_size_limit_exceeded"
     UNCERTAIN_WRITE = "write_outcome_uncertain"
     HTTP_ERROR = "http_error"
     CLOSED = "transport_closed"
@@ -116,6 +117,7 @@ _API_MESSAGES = {
     APIErrorCode.TRANSPORT: "The Google API connection failed.",
     APIErrorCode.UPSTREAM: "Google reported a temporary upstream failure.",
     APIErrorCode.MALFORMED_RESPONSE: "Google returned an invalid or unexpected response.",
+    APIErrorCode.RESPONSE_TOO_LARGE: "The response exceeded the configured byte limit; request fewer cells or metadata fields.",
     APIErrorCode.UNCERTAIN_WRITE: "The write may have completed; inspect its outcome before issuing another mutation.",
     APIErrorCode.HTTP_ERROR: "Google rejected the API request.",
     APIErrorCode.CLOSED: "The transport is closed.",
@@ -171,6 +173,7 @@ class APIClientError(Exception):
                 APIErrorCode.TIMEOUT: APIErrorSource.TRANSPORT,
                 APIErrorCode.TRANSPORT: APIErrorSource.TRANSPORT,
                 APIErrorCode.MALFORMED_RESPONSE: APIErrorSource.TRANSPORT,
+                APIErrorCode.RESPONSE_TOO_LARGE: APIErrorSource.TRANSPORT,
                 APIErrorCode.UNCERTAIN_WRITE: APIErrorSource.TRANSPORT,
             }.get(code, APIErrorSource.CLIENT)
         if any(value not in {"read", "write", "structural", "destructive"} for value in missing_operations):

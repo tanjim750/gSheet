@@ -173,7 +173,7 @@ limit, not a structural-request count. `max_read_cells` is not enforced by this
 raw endpoint layer; SheetService bounds and limits reads using fresh dimensions.
 
 `APIResponse` contains `data` (unaltered Google JSON), status code, local request
-ID, attempt count, and elapsed seconds. Its representation excludes data. Treat
+ID, attempt count, elapsed seconds, `cache_hit`, and `cache_age_seconds`. Its representation excludes data. Treat
 data as untrusted, potentially sensitive spreadsheet content; do not log or expose
 it indiscriminately. No padding, row parsing, or result normalization is performed.
 
@@ -198,8 +198,8 @@ appendDimension, deleteSheet, deleteDimension, mergeCells, unmergeCells,
 updateSheetProperties, updateDimensionProperties, repeatCell, setDataValidation,
 updateCells, appendCells, copyPaste, cutPaste, moveDimension, addNamedRange,
 updateNamedRange, deleteNamedRange, updateBorders, autoResizeDimensions, and sortRange.
-Unknown types fail closed even if named in the policy. These are raw API requests,
-not implemented high-level structural services.
+Unknown types fail closed even if named in the policy. These are raw API requests;
+the service exposes only the high-level conveniences documented below.
 
 The trusted caller owns the association between business, connection, and policy.
 This layer provides spreadsheet/operation grants, not tab/cell ACLs or business
@@ -229,12 +229,12 @@ initiate interactive authorization. An HTTP 401 returns an authentication error
 for explicit caller handling rather than silently switching identity or replaying.
 
 The configured timeout applies per HTTP attempt, not to the whole operation;
-credential refresh and backoff can extend total duration. Local rolling-minute
-read/write budgets use the lower of per-project and per-user settings. Each
+credential refresh and backoff can extend total duration. Rolling-minute budgets
+reserve both a connection slot and a process-wide project slot atomically. Each
 attempt reserves a slot before credential acquisition; an authentication failure
 may consume that slot. Exhaustion fails immediately with a structured throttle
-error and retry delay. These budgets are per transport, not distributed project
-quota enforcement. Disabling throttling does not change Google's quotas.
+error and retry delay. See the P1 operational contract below for project grouping
+and multi-process limits. Disabling throttling does not change Google's quotas.
 
 Transport sessions disable redirects, netrc discovery, environment proxies, and
 implicit transport refresh. TLS verification remains enabled. Proxy configuration
@@ -316,18 +316,26 @@ Worksheet arguments accept an exact title or numeric sheet ID (not tab index).
 | Group | Methods |
 |---|---|
 | Spreadsheet metadata | `get_spreadsheet(fields=...)` |
-| Worksheets | `list_worksheets`, `get_worksheet`, `worksheet_exists`, `create_worksheet`, `rename_worksheet`, `delete_worksheet`, `duplicate_worksheet` |
-| Cells | `read_cell`, `update_cell`, `clear_cell`, `update_cells` |
+| Worksheets | `list_worksheets`, `get_worksheet`, `worksheet_exists`, `create_worksheet`, `rename_worksheet`, `delete_worksheet`, `duplicate_worksheet`, `copy_sheet` |
+| Cells | `read_cell`, `get_cell`, `update_cell`, `clear_cell`, `update_cells`, `find_cells` |
 | Ranges | `read_range`, `update_range`, `clear_range`, `read_ranges`, `update_ranges` |
-| Rows | `read_row`, `read_rows`, `update_row`, `update_rows`, `append_rows`, `insert_rows`, `delete_rows`, `clear_row`, `find_rows` |
+| Rows | `read_row`, `get_row`, `read_rows`, `update_row`, `update_rows`, `append_rows`, `insert_rows`, `delete_rows`, `move_rows`, `clear_row`, `find_rows` |
 | Headers | `read_headers`, `set_headers`, `find_columns`, `find_column`, `rename_header` |
-| Columns | `add_columns`, `insert_columns`, `remove_columns`, `move_columns`, `reorder_columns` |
+| Columns | `read_column`, `get_column`, `add_columns`, `insert_columns`, `remove_columns`, `delete_columns`, `move_columns`, `reorder_columns` |
 | Ordered dimension batches | `batch_structure` |
 | P0 detailed reads and resolution | `resolve_range`, `get_grid_data`, `get_merged_ranges` |
 | Restricted structural foundation | `batch_update` |
+| P1 targeted metadata | `get_spreadsheet_properties`, `get_worksheet_metadata`, `get_dimensions`, `get_effective_cell`, `get_data_validations`, `get_protected_ranges` |
+| P1 structure | `merge_cells`, `unmerge_cells`, `resize_sheet` |
+| P1 bounded streaming | `iter_range_chunks`, `iter_grid_data_chunks` |
+| P2 formatting/setup | `format_range`, `set_data_validation`, `set_column_width`, `set_row_height`, `freeze_rows` |
+| P2 metadata | `get_named_ranges`, `get_developer_metadata`, `get_basic_filter`, `get_filter_views` |
+| P2 range copying | `copy_paste_range` |
 
-All data/structure methods take a worksheet argument, except creation,
-spreadsheet-level batch_update, and the per-worksheet entries in batch_structure.
+Data/structure methods select a worksheet, except creation and spreadsheet-level
+batches. Named-range reads select the entire file; developer-metadata reads can
+select a file, worksheet or bounded dimension region. Range copying explicitly
+selects source and destination worksheets in the service's one spreadsheet.
 Normal mutations return the existing
 APIResponse, retaining actual updated ranges/counts and structural replies from
 Google. Supported safety-enabled dry-runs return RequestPreview instead.
@@ -338,8 +346,9 @@ None when the requested order is already satisfied.
 Metadata methods return APIResponse or WorksheetInfo as appropriate; listing
 returns worksheet metadata in physical tab order. WorksheetInfo includes ID,
 title, tab index, dimensions, merged CellRanges, and raw metadata (excluded from
-repr). No metadata cache is kept. Structural mutations resolve current metadata
-before sending numeric sheet IDs. All service requests still go through client
+repr). Metadata caching is opt-in on the client; default reads remain uncached.
+Structural mutations bypass the cache to resolve current metadata before sending
+numeric sheet IDs. All service requests still go through client
 authorization; metadata resolution means service mutations also need READ.
 
 ### Coordinates and ranges
@@ -655,10 +664,393 @@ atomic compare-and-swap, isolation, oversell prevention, or stable row identity.
 Missing/unobservable data can cause a conservative rejection. No header layout or
 logical record is inferred, and no alternative target is guessed after a conflict.
 
-No authentication or execution/retry algorithm was rewritten for P0. Cache
-policies, distributed quota coordination, cancellation semantics, large-response
-chunking, hidden/filter state, validation/protection inspection, and other P1/P2
-utilities remain deferred; the pre-existing later-phase conveniences are retained.
+No authentication or execution/retry algorithm was rewritten for P0. P1 adds the
+metadata, structural and operational contracts below. P2 extends those same paths
+with the optional utilities documented in its own section.
+
+## P1 structural and metadata contract
+
+The v1.1 P1 scope is Sections 14 Phase 2, 21, 22 and 23 Phase 2. Clearing and
+dimension insertion/deletion were already implemented; they are reused rather
+than replaced. Existing `update_cell`/`update_row` conveniences are also retained.
+The additions below are implementation only and have not been tested in this
+milestone. Section 22's additional test scenarios are deferred to a separate
+testing task. Existing verification scripts and reports are unchanged.
+
+### Targeted reads and result contracts
+
+| Service method | Result and targeting |
+|---|---|
+| `get_spreadsheet_properties(fields=None, force_refresh=False)` | APIResponse with native `properties`; optional property paths such as `locale` and `timeZone` narrow the mask |
+| `get_worksheet_metadata(worksheet, fields=..., force_refresh=False)` | WorksheetMetadata with spreadsheet/worksheet context, requested fields, native tab metadata, and APIResponse |
+| `get_protected_ranges(worksheet, force_refresh=False)` | WorksheetMetadata targeted to `protectedRanges`; inspect `metadata.get("protectedRanges", [])` |
+| `get_dimensions(worksheet, region=None, fields=..., force_refresh=False)` | DimensionsResult with grid counts and, for an explicit region, coordinate-aware row/column DimensionInfo entries |
+| `get_effective_cell(worksheet, row, column, force_refresh=False)` | One padded CellInfo exposing entered formula/value, effective value, formatted string, formats, and error |
+| `get_data_validations(worksheet, region, pad=False, force_refresh=False)` | Bounded GridDataResult; rules appear in `CellInfo.data_validation` and raw CellData |
+
+`WorksheetMetadata.metadata` is the selected native Sheet object, with identity
+properties always included. Its `worksheet` is the resolution context, not a
+transactional snapshot of every requested property. Default generic tab fields
+are properties, merges, protections, basicFilter and filterViews. Optional paths
+can narrow these or request rowGroups/columnGroups. Native absent collection
+fields are not fabricated in the raw payload. Protection editor details may be
+omitted by Google; a read does not grant permission to edit or remove protections.
+
+`get_dimensions` without a region requests only grid properties. Supplying a
+bounded A1/CellRange requests rowMetadata and columnMetadata without cell values.
+The default dimension fields are hiddenByUser, hiddenByFilter and pixelSize;
+callers can narrow them using dot-separated native paths. Arrays are anchored at
+Google's startRow/startColumn and returned as indexed tuples; omitted trailing
+entries are not invented. DimensionInfo flag/size properties return None for
+fields absent from that response. Inspect `requested_fields` and `metadata` to
+distinguish a returned flag from absent/default-omitted information. The combined
+requested row/column count is bounded by `max_read_cells`. Counts are available
+for GRID and DATA_SOURCE sheets; bounded dimension/cell data reads require GRID
+because DATA_SOURCE range restrictions can be ignored by Google. OBJECT sheets
+have no grid. Generic spreadsheet/tab metadata remains available for other types.
+
+`get_grid_data` also accepts the targeted `dataValidation` field, including nested
+paths. Its default remains the same five P0 value/format fields. P2 adds rule
+setting, filter read conveniences and scoped developer-metadata reads below.
+Filter changes and developer-metadata search/mutation endpoints are not exposed.
+
+Merged ranges retain zero-based, end-exclusive coordinates. Their top-left
+`(start_row, start_column)` is the anchor; other cells are covered positions, not
+additional copies of the anchor. `get_merged_ranges(force_refresh=True)` fetches
+current merge metadata. No nested-header meaning is inferred. Sorted and filtered
+worksheets are always read by physical grid coordinates. Hidden rows/columns
+remain in those coordinates; reads do not compact or reconstruct a visual view.
+
+### Structure and write safety
+
+`merge_cells(worksheet, region, merge_type="MERGE_ALL", safety=None)` supports
+MERGE_ALL, MERGE_ROWS and MERGE_COLUMNS. The target must resolve inside a GRID
+worksheet and contain enough cells for the selected merge type. Existing merges
+must be wholly contained if intersected. Merge can discard covered-cell values;
+the caller must explicitly authorize WRITE, STRUCTURAL, DESTRUCTIVE and the
+`mergeCells` request type. No data-preserving merge transformation is implied.
+
+`unmerge_cells(worksheet, region, safety=None)` rejects partial intersection with
+an existing merge; it never expands the target to encompass one. It uses the
+existing WRITE + STRUCTURAL policy and `unmergeCells` allowlist entry. It does not
+restore values previously discarded by a merge.
+
+`resize_sheet(worksheet, rows=None, columns=None, safety=None)` requires at least
+one positive count and changes only those gridProperties fields. It rejects
+non-GRID mutation targets, a cut through an existing merge, or a requested count
+smaller than the existing frozen prefix. Google validates remaining size/layout
+constraints. Shrinking may permanently remove values, formulas and formatting;
+even expansion requires the existing conservative WRITE + STRUCTURAL +
+DESTRUCTIVE grants and an `updateSheetProperties` allowlist entry. It never
+automatically unmerges, unfreezes or otherwise repairs the sheet.
+
+`delete_columns` delegates to the existing `remove_columns`; both names remain
+available. `insert_rows`, `delete_rows`, `insert_columns`, `remove_columns` and
+`delete_columns` now accept `safety=WriteSafety(...)`, forwarding to the same
+restricted batch path. Numeric intervals remain zero-based and end-exclusive.
+`clear_range`/`clear_cell` retain existing value-only clear behavior and grants.
+
+All these structural conveniences return APIResponse or a validation-only
+RequestPreview. Structural preconditions must specify their worksheet explicitly,
+just as for batch_structure/batch_update. Formula protection remains unsupported
+for structural operations with unresolved effects and is rejected when requested;
+it is never silently skipped. Explicit value/identity/dimension/formula
+preconditions and dry-runs remain available. There is no locking or atomic
+compare-and-swap. Structural effects can invalidate previously saved positions.
+
+## P1 freshness and operational contract
+
+### Cache and lifecycle
+
+CacheConfig now controls a bounded, TTL-based metadata cache owned by each client.
+It is disabled by default. Eligible spreadsheets.get responses have grid data
+disabled and a mask that excludes GridData and wildcards. Cache keys include
+spreadsheet ID, requested ranges and normalized query/field mask. Cached payloads
+are copied on storage and retrieval. Cell/validation/dimension-array reads are
+never cached. Authorization and closed-client validation run on every cache hit,
+without obtaining credentials or consuming an HTTP quota slot.
+
+`force_refresh=True` on spreadsheet, worksheet, merge, property or targeted
+metadata reads bypasses eligible entries and replaces that key after a successful
+fetch. CacheConfig.force_refresh globally bypasses entries. APIResponse reports
+cache_hit and cache_age_seconds; cached HTTP status/request ID/attempts/latency
+belong to the original fetch and do not imply a new Google request.
+`SheetsClient.invalidate_metadata()` explicitly clears the cache. Any mutation
+through that client clears all its entries, even after an uncertain outcome.
+P0 coordinate resolution, value/grid reads, mutation target discovery and safety
+checks always use fresh bounds. Other clients and direct external edits cannot
+invalidate this local cache; TTL is a policy, not a freshness guarantee.
+
+Reuse one CredentialManager per trusted connection and one or more clients with
+that same identity/configuration. A SheetService borrows its client and has no
+separate close operation. Clients serialize execute/cache access, own their HTTP
+sessions, and can be reused across successive calls/services for the same trusted
+connection. `close()` or a context manager waits for active execution, closes the
+session and discards cached metadata; further requests fail closed. It does not
+revoke Google authorization, reset the borrowed manager, or remove token files.
+Existing demand-driven refresh and explicit-only OAuth consent remain unchanged.
+After deliberately replacing/resetting a connection's credential identity, create
+a new client before reuse so no metadata from the previous identity is retained.
+
+### Bounds, project policy and large reads
+
+`iter_range_chunks` and `iter_grid_data_chunks` lazily yield ordinary RangeValues
+or GridDataResult tiles. Both require an explicit range (open ends are resolved
+once from fresh dimensions). `chunk_cells=None` uses the lower of
+read_chunk_cells (default 10,000) and max_read_cells. An explicit positive chunk
+size must not exceed max_read_cells. Traversal is row-block then column-block,
+splitting very wide ranges horizontally; combine by returned region coordinates,
+not by concatenating values blindly. Each tile fetches fresh bounds and obeys
+ordinary request/response limits; the total explicit range may exceed the single
+request cell bound. Consume lazily to retain bounded memory, and stop iteration
+to stop future calls. Exceptions preserve already yielded results; there is no
+automatic whole-iterator restart. Concurrent insert/sort/edit/shrink may change
+or invalidate later tiles. This is not a coherent snapshot or page-token API.
+
+Value padding is applied independently to each tile. Google's
+[ValueRange contract](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values#ValueRange)
+omits trailing empty rows and columns. An unentered position returned as an
+interior empty string in a larger read can therefore be omitted at a tile edge
+and padded with None. Reconstructed chunks preserve positions and exposed value
+types, but do not guarantee identical None/empty-string representations to one
+large values read. Returned empty strings remain empty strings; no normalization
+between None and empty strings is performed. Use detailed grid metadata when
+additional empty/omitted distinctions are exposed by Google, without inferring
+that every empty string represents an explicitly stored empty string.
+
+OperationalConfig.max_response_bytes (default 10,485,760) bounds decompressed
+response-body bytes before JSON decoding. A larger read raises
+response_size_limit_exceeded without retrying; reduce cells or requested fields.
+A successful-looking write with an oversized/unreadable response has an uncertain
+outcome and is not replayed. Known HTTP 4xx rejections remain confirmed failures.
+Cell limits do not predict byte size; a single large cell can exceed the byte
+bound, and chunking does not automatically resize/retry a failed tile.
+
+Request reservations are synchronized across clients in one Python process.
+Separate rolling-minute READ/WRITE counters enforce per-connection limits
+(existing *_per_user settings, keyed by the shared CredentialManager) and shared
+per-project limits. Set OperationalConfig.quota_project_id to the same trusted
+project grouping key and consistent limits for every connection using that Google
+API project. This key does not select credentials, set billing headers, or detect
+the project's identity. Without it, all unspecified clients share one conservative
+application-default project pool. New clients with the same manager retain the
+connection's history; a newly created manager starts a new connection history.
+Multiple managers representing the same Google user still need application-side
+coordination of the user's quota. Project counters remain after clients close
+until their entries expire. Multiple processes/services need external admission
+control; this implementation cannot coordinate quotas across them.
+
+Reservations fail fast with locally_throttled and retry_after_seconds when either
+budget is exhausted; blocked reservations consume neither slot. The lower bound
+is effectively enforced by both checks, without queuing or unbounded retry loops.
+The existing per-attempt logs retain local request IDs, hashed targets, operation,
+latency, result category, HTTP status and retry attempt. Cached results retain the
+fetch correlation ID; no synthetic network execution is logged for a cache hit.
+
+### Compatibility, cancellation and deferred work
+
+The API target is Google Sheets REST **v4**, with Python **3.11+** and declared
+`google-auth[requests]>=2.38,<3`, `google-auth-oauthlib>=1.2,<2`; optional dotenv
+remains `python-dotenv>=1.0,<2`. HTTP execution uses requests through the existing
+auth dependency, not discovery-generated wrappers or downloaded files. Existing
+public signatures remain valid; additions use optional keyword parameters and
+defaulted result fields. Unknown native schemas/fields still require Google's
+validation; missing metadata is not reconstructed. Future incompatible API or
+dependency-major upgrades require explicit review and separate verification.
+
+The synchronous API has no cooperative cancellation of an in-flight request.
+Stopping a chunk iterator prevents future requests, not the active call. Timeouts
+apply per HTTP connect/read operation, not as a total wall-clock deadline;
+credential refresh, safe-read retries, body streaming and backoff can extend total
+duration. Closing from another thread waits for the active client call. Interrupting
+the caller or reaching a local timeout cannot cancel a remote write already
+accepted by Google; inspect its effect before retrying. No automatic mutation
+retry has been introduced.
+
+Native shapes follow Google's [Sheet/GridData reference](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/sheets)
+and [batch request reference](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/request).
+Application byte/cell bounds are independent of Google's [quota policy](https://developers.google.com/workspace/sheets/api/limits).
+P0/P1 verification results are recorded separately under `reports/`. P2 additions
+below are implementation only and have not been verified in this milestone.
+
+## P2 optional utilities
+
+P2 covers Section 14 Phase 3 and the P2 methods in Section 21 of specification
+v1.1. It adds generic cell/layout tools without interpreting headers or business
+data. There are no new dependencies, authentication flows, endpoints, quotas or
+cache configuration variables. All requests use the existing client/transport
+and their authorization, error, response-size, quota and retry behavior.
+
+### Coverage and compatibility
+
+| Requirement | Existing support reused | P2 addition |
+|---|---|---|
+| Duplicate a tab | `duplicate_worksheet` / duplicateSheet | `copy_sheet`; both accept optional safety |
+| Move columns | `move_columns` / moveDimension | Optional safety keyword; old positional calls remain valid |
+| Move rows | Ordered dimension batch machinery | `move_rows`; `StructuralChange("move_rows", ...)` |
+| Cell/row conveniences | `read_cell`, `read_row`, update helpers | `get_cell`, `get_row` forwarding aliases |
+| Column reads and bounded search | Range reads and limits | `read_column` / `get_column`, `find_cells` |
+| Formatting, validation, sizing, freezing | Restricted structural batch types | `format_range`, `set_data_validation`, `set_column_width`, `set_row_height`, `freeze_rows` |
+| Named/developer metadata | Targeted spreadsheets.get and dimension metadata | `get_named_ranges`, `get_developer_metadata`; DeveloperMetadataResult |
+| Basic filter / saved views | Generic tab metadata | `get_basic_filter`, `get_filter_views` |
+| Copy selected cell aspects | copyPaste request type already allowed by registry | `copy_paste_range` with an explicit paste policy |
+
+Pre-existing tab creation/rename/deletion, row/cell writing, column reordering,
+clearing, metadata refresh and P0/P1 result contracts remain available. No facade,
+repository layer, external spreadsheet engine or business wrapper is introduced.
+
+### Reads, search and metadata
+
+`get_cell(worksheet, row, column, read_mode=...)` forwards to read_cell and returns
+the same scalar/None contract. `get_row` forwards to read_row with the existing
+start_column/end_column, read_mode and pad keywords and returns a one-row
+RangeValues matrix. `read_column` and `get_column` accept a numeric column,
+start_row=0, end_row=None, read_mode and pad; they return a vertical RangeValues
+matrix. Unknown end rows are resolved against fresh dimensions and read limits
+apply. No additional value coercion or blank normalization is introduced.
+
+`find_cells(worksheet, region, value, read_mode=...)` performs one read-limited,
+padded physical-range read and returns a tuple of single-cell ResolvedRange
+matches in row-major order. Matches have spreadsheet ID, numeric sheet ID, title,
+numeric coordinates and A1 access. Matching is exact and case-sensitive for text;
+booleans are distinct from 0/1, while equal numeric int/float values match. None
+matches unavailable/padded positions in that response, not a guaranteed empty
+cell. There is no regex, fuzzy search, full-file scan, header inference, or search
+and replace. Callers must explicitly select the range.
+
+`get_named_ranges(force_refresh=False)` returns an APIResponse with spreadsheetId
+and the native namedRanges definitions if returned by Google. It does not enable
+named-range strings in APIs that require A1/CellRange input.
+
+`get_basic_filter(worksheet, force_refresh=False)` and
+`get_filter_views(worksheet, force_refresh=False)` return WorksheetMetadata,
+targeted respectively to basicFilter and filterViews. Missing fields stay absent
+in native metadata; callers can use `.metadata.get("basicFilter")` or
+`.metadata.get("filterViews", [])`. These methods inspect saved definitions and do
+not apply a visual view, compact hidden rows, create filters, or sort data.
+
+`get_developer_metadata(worksheet=None, region=None, force_refresh=False)` returns
+DeveloperMetadataResult with spreadsheet ID, optional worksheet/region context,
+a tuple of native metadata dictionaries, and the APIResponse. The selected native
+collection determines scope:
+
+- No worksheet: reads Spreadsheet.developerMetadata.
+- Worksheet without region: reads Sheet.developerMetadata.
+- Worksheet plus region: reads developerMetadata from the selected rowMetadata
+  and columnMetadata through get_dimensions; repeated metadata IDs are deduplicated
+  without changing entries. Conflicting payloads for one ID are rejected.
+
+Each returned entry's native `location` remains authoritative. A bounded region
+selects row/column metadata, not arbitrary permanent cell identifiers. No whole
+grid scan or metadata search endpoint is used; metadata not exposed in the
+selected collection is not invented. Region input requires a worksheet. Dimension
+read limits and GRID restrictions apply as in P1. These metadata methods support
+force-refresh; only eligible non-grid responses use the existing optional cache.
+DeveloperMetadataResult.metadata and its response are excluded from repr.
+
+### Formatting and setup mutations
+
+`format_range(worksheet, region, formatting, fields=None, safety=None)` accepts a
+native CellFormat object. Without fields, it derives a mask from the supplied
+leaf properties, preserving unrelated formatting. Empty nested objects require
+an explicit mask to state what should be reset. Explicit fields are a nonempty
+list/tuple of relative CellFormat paths such as `textFormat.bold` or
+`numberFormat`; they are always prefixed with userEnteredFormat. Wildcards and
+cell-value masks are rejected. Explicit parent paths replace/reset that selected
+format object according to Google field-mask semantics. An explicit mask can
+reset a selected property omitted from formatting; no unspecified value/formula,
+note, validation rule or other cell aspect is requested for modification.
+
+`set_data_validation(worksheet, region, rule, filtered_rows_included=False,
+safety=None)` requires a native DataValidationRule or an explicit None. None
+clears rules only. Rules include a condition with native type/values and optional
+inputMessage, strict and showCustomUi. Native condition-specific counts and schema
+constraints are ultimately validated by Google. Dropdown lists use ONE_OF_LIST,
+range dropdowns ONE_OF_RANGE, and custom formula rules CUSTOM_FORMULA; rule
+formulas and references are an explicit caller-selected policy. Checkbox/BOOLEAN
+rules can populate an unchecked FALSE value, as observed during P1 fixture setup.
+Removing a rule does not imply clearing its cell values. Include filtered rows
+only with filtered_rows_included=True; this does not change the filter definition.
+
+`set_column_width(worksheet, start, end, width, safety=None)` and
+`set_row_height(worksheet, start, end, height, safety=None)` take zero-based,
+end-exclusive dimension intervals and positive integer pixel sizes. They change
+only pixelSize; hidden/filter state and other dimension properties are not
+included in the mutation mask. `freeze_rows(worksheet, count, safety=None)` sets
+only frozenRowCount; count is zero through the current row count, with zero
+explicitly unfreezing. It never resizes the grid. Google validates remaining
+native layout constraints. These setup mutations require GRID worksheets.
+
+### Copies and moves
+
+`copy_sheet(worksheet, title=None, safety=None)` duplicates within the current
+spreadsheet by forwarding to duplicate_worksheet. The Google response retains
+the new numeric tab ID/properties. Cross-file copying is not implied.
+
+`move_rows(worksheet, start, end, destination, safety=None)` and move_columns
+use Google's pre-removal destination convention. Intervals are zero-based and
+end-exclusive; an in-source/no-op destination is rejected consistently with the
+existing column-move contract. Ordered batch_structure accepts move_rows as well
+as all pre-existing StructuralChange operations. Positions are not stable IDs.
+
+`copy_paste_range(source_worksheet, source_region, destination_worksheet,
+destination_region, paste_type=REQUIRED, paste_orientation="NORMAL", safety=None)`
+copies only within this service's spreadsheet. The paste mode must explicitly be
+one of PASTE_NORMAL, PASTE_VALUES, PASTE_FORMAT, PASTE_NO_BORDERS, PASTE_FORMULA,
+PASTE_DATA_VALIDATION or PASTE_CONDITIONAL_FORMATTING. Orientation is NORMAL or
+TRANSPOSE. Modes select native cell aspects; PASTE_NORMAL/PASTE_NO_BORDERS can also
+copy formulas/merges. This is not a USER_ENTERED string-parsing API.
+
+Both ranges resolve against fresh metadata and must be inside GRID sheets.
+Partial intersections with existing merges are rejected. The destination height
+and width must each be a positive multiple of the oriented source dimensions.
+Exact matches copy once; explicit larger multiples use native repetition inside
+the stated destination. Smaller or incompatible rectangles are rejected because
+Google can otherwise expand a too-small destination beyond its stated end.
+No implicit grid expansion, target adjustment or merge repair is performed.
+
+### Authorization, preconditions and outcomes
+
+| Mutation | Required batch request grant | Required operations beyond READ |
+|---|---|---|
+| format_range | repeatCell | WRITE, STRUCTURAL |
+| set_data_validation | setDataValidation | WRITE, STRUCTURAL |
+| set_column_width / set_row_height | updateDimensionProperties | WRITE, STRUCTURAL |
+| freeze_rows | updateSheetProperties | WRITE, STRUCTURAL, DESTRUCTIVE (existing conservative policy) |
+| copy_sheet / duplicate_worksheet | duplicateSheet | WRITE, STRUCTURAL |
+| move_rows / move_columns | moveDimension | WRITE, STRUCTURAL, DESTRUCTIVE |
+| copy_paste_range | copyPaste | WRITE, STRUCTURAL |
+
+Fresh metadata reads require READ as with existing service mutations. No default
+grants are broadened and the supported batch-type registry is unchanged. The
+copyPaste grant explicitly permits overwriting destination aspects, while the
+source is retained. Per-mode limits belong in trusted application tools; do not
+expose unrestricted administrative grants to untrusted sheet content.
+
+All P2 mutations accept WriteSafety and return APIResponse or RequestPreview.
+Copies/moves/setup use the same precondition and validation-only machinery;
+previews reserve nothing and are never executable authorization capabilities.
+For structural/setup operations, preconditions require explicit worksheet
+selectors and explicit regions when comparing values/formulas. Raw structural
+formula protection remains unsupported and fails closed when requested.
+
+Range copying can resolve its destination, so it additionally supports
+protect_formulas=True: every destination position is conservatively treated as
+potentially touched, even in format-only modes. A reported formula blocks the
+copy. Destination preconditions can omit worksheet/region; source preconditions
+must specify them. Formula-protection scans obey max_read_cells. No atomicity or
+concurrent-editor isolation is claimed, and a successful response does not
+substitute for separate optional read-back.
+
+Eligible metadata caches invalidate on these mutations through the existing
+client. Every mutation still receives one HTTP attempt; timeout/ambiguous results
+remain uncertain and are never automatically replayed. Errors remain sanitized
+and structured. Native Google schema/protection restrictions still apply.
+
+P2 implementation has not been tested in this milestone. No offline verification
+suite or live Sheets API operation was run, and existing verification reports
+and scripts were not modified. Separate manual verification is required before
+claiming P2 readiness.
 
 ### Manual disposable-worksheet verification
 

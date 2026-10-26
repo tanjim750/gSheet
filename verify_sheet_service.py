@@ -289,7 +289,9 @@ class P0Checks(unittest.TestCase):
                      "effectiveValue": {"errorValue": {"type": "DIVIDE_BY_ZERO", "message": "SECRET_MARKER"}}},
         }
 
-        def spreadsheet(identifier, *, params=None):
+        def spreadsheet(identifier, *, params=None, force_refresh=False):
+            # This fake always returns current fixture state; it has no cache.
+            self.assertIs(type(force_refresh), bool)
             if not params or not params.get("includeGridData"):
                 return response(METADATA)
             title, region = parse_a1_range(params["ranges"][0])
