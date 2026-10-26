@@ -9,8 +9,8 @@ it never changes os.environ or searches parent directories for secret files.
 Timeouts/backoffs/TTLs are seconds. Numeric defaults other than quota budgets
 are application policy, not Google limits. Quota defaults are documented at
 https://developers.google.com/workspace/sheets/api/limits ; quotas can vary by
-project. Batch limits count ranges, not cells or bytes. Runtime enforcement is
-the responsibility of future clients/services. Retry categories only identify
+project. Batch limits count ranges, not cells or bytes. Clients enforce request
+budgets/response bytes; services enforce cell and chunk bounds. Retry categories only identify
 candidates: unsafe or uncertain writes must never be blindly replayed.
 
 No raw keys or tokens are accepted. Credential/token locations are excluded
@@ -170,7 +170,7 @@ class RetryConfig(_Section):
     initial_delay_seconds: float = 1.0
     max_delay_seconds: float = 32.0
     multiplier: float = 2.0
-    # Future full jitter samples [0, capped delay]; additive adds up to 1s before
+    # Full jitter samples [0, capped delay]; additive adds up to 1s before
     # capping; none leaves the capped delay unchanged. No delays execute here.
     jitter: Literal["none", "full", "additive"] = "full"
     retryable_categories: tuple[str, ...] = ("rate_limit", "temporary_upstream")
@@ -211,11 +211,14 @@ class OperationalConfig(_Section):
     max_read_batch_ranges: int = 100
     max_write_batch_ranges: int = 100
     max_read_cells: int = 100_000
+    read_chunk_cells: int = 10_000
+    max_response_bytes: int = 10_485_760
+    quota_project_id: str | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         for item in fields(self):
-            if item.name not in {"logging_level", "throttling_enabled"}:
+            if item.name not in {"logging_level", "throttling_enabled", "quota_project_id"}:
                 _positive(f"operations.{item.name}", getattr(self, item.name))
 
 
